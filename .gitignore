@@ -1,0 +1,13 @@
+# Zugangsdaten – niemals committen
+.env
+*.env
+!.env.example
+
+# Laufzeitdaten
+state.json
+*.ics
+!tests/**/*.ics
+
+__pycache__/
+*.pyc
+.DS_Store

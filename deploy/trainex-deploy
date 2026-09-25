@@ -1,0 +1,96 @@
+#!/bin/bash
+# trainex-deploy – spielt ein neues Release ein (läuft als root via sudo).
+# Wird vom GitHub-Deploy über SSH als erzwungener Befehl aufgerufen und liest ein tar.gz von stdin.
+# Installiert nur feste Dateien, prüft sie vorher und rollt bei Fehlern automatisch zurück.
+set -euo pipefail
+umask 022
+
+APP=/opt/trainex-sync
+UNIT=/etc/systemd/system/trainex-sync.service
+SNIPPET=/etc/nginx/snippets/trainex.conf
+FILES=(trainex_sync.py trainex-sync.service trainex.conf .env.example)
+MAX_BYTES=$((5 * 1024 * 1024))
+
+log() { echo "[deploy] $*"; }
+die() { echo "[deploy] FEHLER: $*" >&2; exit 1; }
+
+exec 9>/run/trainex-deploy.lock
+flock -w 60 9 || die "Ein anderer Deploy läuft gerade."
+
+[[ -f $APP/.env ]] || die "$APP/.env fehlt – erst Erstinstallation mit install.sh durchführen."
+
+TMP=$(mktemp -d /tmp/trainex-deploy.XXXXXX)
+trap 'rm -rf "$TMP"' EXIT
+
+# 1) Paket empfangen und nur die erwarteten Dateien entpacken
+head -c "$MAX_BYTES" > "$TMP/release.tgz"
+[[ -s $TMP/release.tgz ]] || die "Leeres Paket empfangen."
+mkdir "$TMP/src"
+tar -xzf "$TMP/release.tgz" -C "$TMP/src" --no-same-owner --no-same-permissions "${FILES[@]}" \
+    || die "Paket unvollständig (erwartet: ${FILES[*]})."
+for f in "${FILES[@]}"; do
+    [[ -f $TMP/src/$f && ! -L $TMP/src/$f ]] || die "$f fehlt im Paket."
+done
+
+# 2) Vorab prüfen
+NEW_VERSION=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$TMP/src/trainex_sync.py")
+[[ -n $NEW_VERSION ]] || die "Version in trainex_sync.py nicht gefunden."
+PYTHONDONTWRITEBYTECODE=1 python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" \
+    "$TMP/src/trainex_sync.py" || die "trainex_sync.py hat Syntaxfehler."
+grep -q '^User=trainex$' "$TMP/src/trainex-sync.service" \
+    || die "Unit muss als User=trainex laufen – abgelehnt."
+OLD_VERSION=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$APP/trainex_sync.py" 2>/dev/null || true)
+log "Version ${OLD_VERSION:-?} → $NEW_VERSION"
+
+# 3) Sicherung
+cp -a "$APP/trainex_sync.py" "$APP/trainex_sync.py.prev"
+cp -a "$UNIT" "$TMP/unit.prev"
+[[ -f $SNIPPET ]] && cp -a "$SNIPPET" "$TMP/snippet.prev"
+
+rollback() {
+    log "Rollback auf ${OLD_VERSION:-vorherige Version} …"
+    cp -a "$APP/trainex_sync.py.prev" "$APP/trainex_sync.py"
+    cp -a "$TMP/unit.prev" "$UNIT"
+    systemctl daemon-reload
+    systemctl restart trainex-sync || true
+    journalctl -u trainex-sync -n 30 --no-pager || true
+}
+
+# 4) Installieren
+install -m 755 -o root -g root "$TMP/src/trainex_sync.py" "$APP/trainex_sync.py"
+install -m 644 -o root -g root "$TMP/src/.env.example" "$APP/.env.example"
+
+if ! cmp -s "$TMP/src/trainex-sync.service" "$UNIT"; then
+    install -m 644 -o root -g root "$TMP/src/trainex-sync.service" "$UNIT"
+    systemctl daemon-reload
+    log "systemd-Unit aktualisiert."
+fi
+
+if ! cmp -s "$TMP/src/trainex.conf" "$SNIPPET"; then
+    install -m 644 -o root -g root "$TMP/src/trainex.conf" "$SNIPPET"
+    if nginx -t 2>"$TMP/nginx.err"; then
+        systemctl reload nginx
+        log "nginx-Snippet aktualisiert."
+    else
+        cat "$TMP/nginx.err" >&2
+        if [[ -f $TMP/snippet.prev ]]; then cp -a "$TMP/snippet.prev" "$SNIPPET"; else rm -f "$SNIPPET"; fi
+        rollback
+        die "nginx -t fehlgeschlagen – Snippet und Dienst zurückgesetzt."
+    fi
+fi
+
+# 5) Neu starten und prüfen
+START=$(date '+%Y-%m-%d %H:%M:%S')
+systemctl restart trainex-sync
+sleep 8
+if ! systemctl is-active --quiet trainex-sync; then
+    journalctl -u trainex-sync -n 30 --no-pager >&2 || true
+    rollback
+    die "Dienst startet nicht sauber – zurückgerollt."
+fi
+if ! journalctl -u trainex-sync --since "$START" --no-pager | grep -q "trainex-sync $NEW_VERSION gestartet"; then
+    rollback
+    die "Startmeldung von v$NEW_VERSION fehlt – zurückgerollt."
+fi
+
+log "✓ v$NEW_VERSION läuft."

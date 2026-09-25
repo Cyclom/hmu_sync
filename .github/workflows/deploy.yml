@@ -1,0 +1,71 @@
+name: Test & Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # wie Debian 12 auf dem vServer
+
+      - name: Syntax prüfen
+        run: |
+          python -m py_compile trainex_sync.py
+          bash -n install.sh deploy/trainex-deploy deploy/setup-deploy.sh
+          grep -q '^User=trainex$' trainex-sync.service
+
+      - name: Unit-Tests
+        run: python -m unittest discover -s tests -v
+
+  deploy:
+    name: Deploy auf vServer
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SSH-Zugang einrichten
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          test -n "$DEPLOY_SSH_KEY" || { echo "::error::Secret DEPLOY_SSH_KEY fehlt"; exit 1; }
+          test -n "$DEPLOY_KNOWN_HOSTS" || { echo "::error::Secret DEPLOY_KNOWN_HOSTS fehlt"; exit 1; }
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Release übertragen und einspielen
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+        run: |
+          tar -czf - trainex_sync.py trainex-sync.service trainex.conf .env.example \
+            | ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" \
+                  -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+                  "trainex-deploy@$DEPLOY_HOST"
+
+      - name: Aufräumen
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

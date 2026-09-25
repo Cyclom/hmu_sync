@@ -1,0 +1,43 @@
+[Unit]
+Description=TraiNex -> iCal-Abo + Telegram-Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trainex
+Group=trainex
+SupplementaryGroups=adm
+EnvironmentFile=/opt/trainex-sync/.env
+Environment=TZ=Europe/Berlin PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -u /opt/trainex-sync/trainex_sync.py run
+Restart=always
+RestartSec=15
+
+StateDirectory=trainex-sync
+StateDirectoryMode=0700
+ReadWritePaths=/var/www/trainex
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target
