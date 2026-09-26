@@ -23,7 +23,7 @@ import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 
-VERSION = "1.8"
+VERSION = "1.9"
 TZ = ZoneInfo("Europe/Berlin")
 UA = f"trainex-sync/{VERSION} (private calendar sync)"
 WD = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
@@ -688,6 +688,7 @@ class State:
         s.setdefault("auto", True)
         s.setdefault("interval", cfg.default_interval)
         s.setdefault("token", "")
+        s.setdefault("channels", [])
         self.d.setdefault("fails", 0)
 
     def save(self):
@@ -792,6 +793,17 @@ class App:
         if self.tg:
             self.tg.send(self.cfg.admin, text)
 
+    def channels(self):
+        """Über /addchannel registrierte Kanäle, sonst Fallback auf TELEGRAM_CHANNEL_ID aus .env."""
+        chans = self.st.settings.get("channels", [])
+        if chans:
+            return chans
+        return [{"id": self.cfg.channel, "title": ""}] if self.cfg.channel else []
+
+    def notify_channels(self, text):
+        for c in self.channels():
+            self.tg.send(c["id"], text)
+
     def sync(self, force=False, source="auto"):
         t0 = time.time()
         now = dt.datetime.now(TZ)
@@ -832,7 +844,10 @@ class App:
             text = (f"📅 <b>Stundenplan geändert</b> ({len(entries)})\n\n" + "\n\n".join(blocks)
                     + f"\n\n{self.abo_link()}")
             if self.tg:
-                self.tg.send(self.cfg.channel or self.cfg.admin, text)
+                if self.channels():
+                    self.notify_channels(text)
+                else:
+                    self.tg.send(self.cfg.admin, text)
         if recovered:
             self.notify_admin("✅ Sync funktioniert wieder.")
         return run
@@ -909,6 +924,10 @@ class App:
             L.append(f"Nächster Termin: {fmt_day(nx)} {fmt_time(nx)} · {e(short(nx))} ({e(room(nx))})")
         st = self.access_stats()
         L.append(f"Abo-Abrufe 24 h: {st[0]} von {st[1]} Geräten/IPs" if st else "Abo-Abrufe 24 h: n/a")
+        chans = self.st.settings.get("channels", [])
+        L.append("Kanäle: " + (", ".join(e(c["title"] or str(c["id"])) for c in chans) if chans
+                                else (f"– (Fallback aus .env: <code>{self.cfg.channel}</code>)" if self.cfg.channel
+                                      else "keiner registriert – /addchannel im Kanal posten")))
         up_s = int(time.time() - self.started)
         L += ["", f"{self.abo_link()}: {e(self.page_url())}",
               f"Laufzeit: {up_s // 86400} d {up_s % 86400 // 3600} h {up_s % 3600 // 60} min · v{VERSION}"]
@@ -925,7 +944,11 @@ class App:
             "/status – Status anzeigen\n"
             "/url – Abo-URL anzeigen\n"
             "/newurl – neue geheime Abo-URL erzeugen (alte wird ungültig)\n"
-            "/help – diese Hilfe")
+            "/channels – registrierte Kanäle anzeigen\n"
+            "/help – diese Hilfe\n\n"
+            "📡 <b>Kanal hinzufügen/entfernen</b>\n"
+            "Bot als Admin in den Kanal holen, dann direkt im Kanal <code>/addchannel</code> posten "
+            "(bzw. <code>/removechannel</code> zum Entfernen). Kein .env-Eintrag mehr nötig.")
 
     def handle(self, text):
         parts = text.strip().split()
@@ -937,7 +960,7 @@ class App:
             r = self.sync(force=(arg.lower() == "force"), source="manual")
             if r["ok"]:
                 self.notify_admin(f"✅ Fertig in {r['dur']:.1f}s: {e(r['msg'])}"
-                                  + (" (im Kanal gepostet)" if r.get("changes") and self.cfg.channel else ""))
+                                  + (" (im Kanal gepostet)" if r.get("changes") and self.channels() else ""))
             if s["auto"]:
                 self.schedule_from(time.time())
         elif cmd == "/start":
@@ -975,10 +998,53 @@ class App:
                     pass
             self.notify_admin(f"🔑 Neue Abo-URL, die alte ist ab sofort ungültig:\n"
                               f"{self.abo_link()}\n{e(self.page_url())}")
+        elif cmd == "/channels":
+            chans = self.st.settings.get("channels", [])
+            if chans:
+                lines = [f"• {e(c['title'] or str(c['id']))} (<code>{c['id']}</code>)" for c in chans]
+                self.notify_admin("📡 <b>Registrierte Kanäle</b>\n" + "\n".join(lines))
+            elif self.cfg.channel:
+                self.notify_admin(f"Kein Kanal über Telegram registriert. Fallback aus .env: "
+                                  f"<code>{e(self.cfg.channel)}</code>")
+            else:
+                self.notify_admin("Kein Kanal registriert. Bot als Admin in einen Kanal holen und dort "
+                                  "/addchannel posten.")
         elif cmd == "/help":
             self.notify_admin(self.HELP)
         else:
             self.notify_admin("Unbekannter Befehl. /help")
+
+    def handle_channel(self, m):
+        """Verarbeitet /addchannel und /removechannel, die direkt im Kanal gepostet werden."""
+        txt = (m.get("text") or "").strip()
+        if not txt.startswith("/"):
+            return
+        cmd = txt.split()[0].split("@")[0].lower()
+        if cmd not in ("/addchannel", "/removechannel"):
+            return
+        chat = m.get("chat") or {}
+        cid = chat.get("id")
+        title = chat.get("title") or chat.get("username") or str(cid)
+        if cid is None:
+            return
+        chans = self.st.settings.setdefault("channels", [])
+        if cmd == "/addchannel":
+            if any(c["id"] == cid for c in chans):
+                self.tg.send(cid, "ℹ️ Dieser Kanal ist bereits registriert.")
+                return
+            chans.append({"id": cid, "title": title})
+            self.st.save()
+            self.tg.send(cid, "✅ Dieser Kanal ist jetzt für Änderungsmeldungen registriert.")
+            self.notify_admin(f"➕ Kanal hinzugefügt: {e(title)} (<code>{cid}</code>)")
+        else:
+            before = len(chans)
+            chans[:] = [c for c in chans if c["id"] != cid]
+            if len(chans) == before:
+                self.tg.send(cid, "ℹ️ Dieser Kanal war nicht registriert.")
+                return
+            self.st.save()
+            self.tg.send(cid, "✅ Dieser Kanal wurde entfernt.")
+            self.notify_admin(f"➖ Kanal entfernt: {e(title)} (<code>{cid}</code>)")
 
     def run(self):
         c = self.cfg
@@ -992,7 +1058,8 @@ class App:
                     ("sync", "Jetzt abgleichen"), ("status", "Status anzeigen"),
                     ("start", "Auto-Sync einschalten"), ("stop", "Auto-Sync ausschalten"),
                     ("settime", "Intervall in Minuten setzen"), ("url", "Abo-URL"),
-                    ("newurl", "Neue Abo-URL erzeugen"), ("help", "Hilfe")]],
+                    ("newurl", "Neue Abo-URL erzeugen"), ("channels", "Registrierte Kanäle anzeigen"),
+                    ("help", "Hilfe")]],
                 scope={"type": "chat", "chat_id": int(c.admin)})
         except Exception as ex:
             log("setMyCommands:", ex)
@@ -1021,7 +1088,7 @@ class App:
             if self.st.settings["auto"]:
                 wait = int(max(1, min(50, self.next_run - now)))
             try:
-                params = {"timeout": wait, "allowed_updates": ["message"]}
+                params = {"timeout": wait, "allowed_updates": ["message", "channel_post"]}
                 if offset is not None:
                     params["offset"] = offset
                 updates = self.tg.call("getUpdates", http_timeout=wait + 15, **params)
@@ -1031,6 +1098,13 @@ class App:
                 continue
             for u in updates:
                 offset = u["update_id"] + 1
+                cp = u.get("channel_post")
+                if cp:
+                    try:
+                        self.handle_channel(cp)
+                    except Exception as ex:
+                        log("Fehler bei Kanal-Befehl:", repr(ex))
+                    continue
                 m = u.get("message") or {}
                 txt = m.get("text") or ""
                 if not txt.startswith("/"):
@@ -1097,7 +1171,8 @@ def cmd_discover(cfg):
               "dann erneut ausführen.")
     for cid, (typ, name) in seen.items():
         hint = {"user": "→ TELEGRAM_ADMIN_ID", "private": "→ TELEGRAM_ADMIN_ID",
-                "channel": "→ TELEGRAM_CHANNEL_ID"}.get(typ, "")
+                "channel": "(optional in TELEGRAM_CHANNEL_ID; einfacher: /addchannel direkt im Kanal posten)"
+                }.get(typ, "")
         print(f"{typ:10} {cid:>16}  {name}  {hint}")
 
 
@@ -1110,10 +1185,14 @@ def cmd_testmsg(cfg):
                 f"Hast du @{me['username']} im privaten Chat schon /start geschickt? Bots dürfen nur "
                 "Nutzern schreiben, die sie vorher angeschrieben haben. Die ID muss deine numerische "
                 "User-ID sein (sudo ./install.sh discover), nicht die ID des Bots oder dein @Name.")]
-    if cfg.channel:
+    chan_hint = f"Ist @{me['username']} Admin im Kanal? Die Kanal-ID beginnt mit -100."
+    chans = State(cfg).settings.get("channels", [])
+    if chans:
+        for c in chans:
+            targets.append((f"Kanal „{c['title'] or c['id']}“", "state.json", c["id"], chan_hint))
+    elif cfg.channel:
         targets.append(("Kanal", "TELEGRAM_CHANNEL_ID", cfg.channel,
-                        f"Ist @{me['username']} Admin im Kanal? Die Kanal-ID beginnt mit -100 "
-                        "(sudo ./install.sh discover, vorher etwas im Kanal posten)."))
+                        chan_hint + " (sudo ./install.sh discover, vorher etwas im Kanal posten)."))
     ok = True
     for name, var, chat, hint in targets:
         try:
