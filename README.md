@@ -24,8 +24,9 @@ tests/                       Unit-Tests (synthetische Daten)
    Wenn er privat ist, treten Kollegen über einen Einladungslink bei.
 3. **Bot zum Admin machen:** Kanal → Verwalten → Administratoren → Bot hinzufügen.
    Die Berechtigung „Nachrichten senden“ reicht.
-4. **IDs sichtbar machen:** Schreib dem Bot im privaten Chat irgendeine Nachricht (z. B. `hallo`)
-   und poste etwas in den Kanal. Danach findet `discover` die IDs (Schritt 2.4).
+4. **IDs sichtbar machen:** Schreib dem Bot im privaten Chat irgendeine Nachricht (z. B. `hallo`).
+   Danach findet `discover` deine Admin-ID (Schritt 2.4). Den Kanal selbst musst du nicht mehr per
+   `.env`/`discover` eintragen – das geht direkt in Telegram, siehe Abschnitt 4.
 
 ## 2. Installation auf dem vServer
 
@@ -39,10 +40,12 @@ chmod +x install.sh
 sudo ./install.sh                      # 2.1 installieren
 sudo nano /opt/trainex-sync/.env       # 2.2 TRAINEX_USER, TRAINEX_PASS, TELEGRAM_BOT_TOKEN eintragen
 sudo ./install.sh check                # 2.3 TraiNex-Abruf testen
-sudo ./install.sh discover             # 2.4 IDs anzeigen
-sudo nano /opt/trainex-sync/.env       # 2.5 TELEGRAM_ADMIN_ID + TELEGRAM_CHANNEL_ID eintragen
-sudo ./install.sh testmsg              # 2.6 Testnachricht an dich + Kanal
+sudo ./install.sh discover             # 2.4 Admin-ID anzeigen
+sudo nano /opt/trainex-sync/.env       # 2.5 TELEGRAM_ADMIN_ID eintragen
+sudo ./install.sh testmsg              # 2.6 Testnachricht an dich (+ Kanal, falls schon hinzugefügt)
 ```
+
+Den Kanal fürs Änderungs-Feed richtest du nach dem Start direkt in Telegram ein (Abschnitt 4, `/addchannel`).
 
 Wenn `check` die Meldung *„Login + Export ok … 145 Termine“* zeigt, funktioniert der Abruf.
 Meldet es **Cloudflare blockiert**, lässt TraiNex Anfragen von deinem Server nicht durch. Dann bitte
@@ -110,13 +113,22 @@ nach oben wischen → Koordinaten kopieren.
 | `/sync force` | abgleichen und den Löschschutz übergehen (z. B. beim Semesterwechsel) |
 | `/start` / `/stop` | automatischen Sync ein- oder ausschalten |
 | `/settime 60` | Intervall in Minuten (15–10080) |
-| `/status` | Auto-Sync, Intervall, nächster/letzter Lauf, letzte Änderungen, Terminzahl, nächster Termin, Abo-Abrufe der letzten 24 h |
+| `/status` | Auto-Sync, Intervall, nächster/letzter Lauf, letzte Änderungen, Terminzahl, nächster Termin, Abo-Abrufe der letzten 24 h, registrierte Kanäle |
 | `/url` | Abo-URL anzeigen |
 | `/newurl` | neue geheime URL erzeugen; die alte ist sofort ungültig und alle müssen neu abonnieren |
+| `/channels` | registrierte Kanäle anzeigen |
 | `/help` | Hilfe |
 
 Einstellungen bleiben bei einem Neustart erhalten. In der Ruhezeit (`QUIET_HOURS`, standardmäßig
 22–6 Uhr) laufen keine automatischen Syncs, `/sync` funktioniert aber immer.
+
+### Kanal direkt in Telegram hinzufügen/entfernen
+
+Kein `.env`-Eintrag mehr nötig: Bot als Admin in einen Kanal holen (Nachrichten senden reicht) und dort
+**direkt im Kanal** `/addchannel` posten. Der Bot bestätigt im Kanal und meldet sich zusätzlich bei dir
+privat. `/removechannel` im selben Kanal nimmt ihn wieder raus. Es können mehrere Kanäle gleichzeitig
+registriert sein – Änderungsmeldungen gehen dann an alle. `TELEGRAM_CHANNEL_ID` in der `.env` funktioniert
+weiterhin als Fallback, wird aber ignoriert, sobald mindestens ein Kanal über `/addchannel` registriert ist.
 
 ## 5. Was im Kanal gemeldet wird
 

@@ -210,5 +210,56 @@ class Misc(unittest.TestCase):
         self.assertFalse(app.in_quiet(at(12)))
 
 
+class FakeTG:
+    def __init__(self):
+        self.sent = []  # (chat_id, text)
+
+    def send(self, chat, text):
+        self.sent.append((chat, text))
+
+
+class Channels(unittest.TestCase):
+    def make_app(self):
+        os.environ["STATE_DIRECTORY"] = tempfile.mkdtemp()
+        os.environ["TELEGRAM_ADMIN_ID"] = "111"
+        app = T.App.__new__(T.App)
+        app.cfg = T.Cfg()
+        app.st = T.State(app.cfg)
+        app.tg = FakeTG()
+        return app
+
+    def test_addchannel_registers_and_confirms(self):
+        app = self.make_app()
+        app.handle_channel({"text": "/addchannel", "chat": {"id": -100123, "title": "HMU Plan"}})
+        self.assertEqual(app.st.settings["channels"], [{"id": -100123, "title": "HMU Plan"}])
+        chats = [c for c, _ in app.tg.sent]
+        self.assertIn(-100123, chats)   # Bestätigung im Kanal
+        self.assertIn("111", [str(c) for c in chats])  # Info an Admin
+
+    def test_addchannel_twice_is_noop(self):
+        app = self.make_app()
+        msg = {"text": "/addchannel", "chat": {"id": -100123, "title": "HMU Plan"}}
+        app.handle_channel(msg)
+        app.handle_channel(msg)
+        self.assertEqual(len(app.st.settings["channels"]), 1)
+
+    def test_removechannel(self):
+        app = self.make_app()
+        app.st.settings["channels"] = [{"id": -100123, "title": "HMU Plan"}]
+        app.handle_channel({"text": "/removechannel", "chat": {"id": -100123, "title": "HMU Plan"}})
+        self.assertEqual(app.st.settings["channels"], [])
+
+    def test_removechannel_unknown_channel_is_noop(self):
+        app = self.make_app()
+        app.handle_channel({"text": "/removechannel", "chat": {"id": -100999, "title": "Anderer"}})
+        self.assertEqual(app.st.settings["channels"], [])
+
+    def test_channels_helper_falls_back_to_env(self):
+        os.environ["TELEGRAM_CHANNEL_ID"] = "-100555"
+        app = self.make_app()
+        self.assertEqual(app.channels(), [{"id": "-100555", "title": ""}])
+        del os.environ["TELEGRAM_CHANNEL_ID"]
+
+
 if __name__ == "__main__":
     unittest.main()
