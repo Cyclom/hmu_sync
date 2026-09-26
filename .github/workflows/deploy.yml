@@ -54,7 +54,18 @@ jobs:
           install -d -m 700 ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+          # Host-Key unter festem Alias ablegen – unabhängig von IP/Domain/Port.
+          # Akzeptiert "ssh-ed25519 AAAA..." ebenso wie "host ssh-ed25519 AAAA...".
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" | tr -d '\r' \
+            | grep -v '^[[:space:]]*#' \
+            | awk 'NF>=2 && $(NF-1) ~ /^(ssh-|ecdsa-)/ {print "trainex-vserver", $(NF-1), $NF}' \
+            > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+          test -s ~/.ssh/known_hosts || { echo "::error::DEPLOY_KNOWN_HOSTS enthält keinen gültigen Host-Key"; exit 1; }
+          echo "Hinterlegter Host-Key:"
+          ssh-keygen -lf ~/.ssh/known_hosts
 
       - name: Release übertragen und einspielen
         env:
@@ -64,8 +75,10 @@ jobs:
           tar -czf - trainex_sync.py trainex-sync.service trainex.conf .env.example \
             | ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" \
                   -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+                  -o HostKeyAlias=trainex-vserver \
+                  -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
                   "trainex-deploy@$DEPLOY_HOST"
 
       - name: Aufräumen
         if: always()
-        run: rm -f ~/.ssh/deploy_key
+        run: rm -f ~/.ssh/deploy_key ~/.ssh/known_hosts
