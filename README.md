@@ -117,10 +117,43 @@ nach oben wischen → Koordinaten kopieren.
 | `/url` | Abo-URL anzeigen |
 | `/newurl` | neue geheime URL erzeugen; die alte ist sofort ungültig und alle müssen neu abonnieren |
 | `/channels` | registrierte Kanäle anzeigen |
+| `/modules` | Module mit Terminzahl, Minuten und Fehlzeit-Budget (siehe unten) |
+| `/modules M11` | alle Termine eines Moduls, mit Buttons zum Eintragen von Fehlzeiten |
+| `/modules alle` | auch Module ohne kommende Termine |
+| `/absent M11 3 [min]` | Fehlzeit für Termin Nr. 3 eintragen: ohne Minuten der ganze Termin, `0` löscht |
 | `/help` | Hilfe |
 
 Einstellungen bleiben bei einem Neustart erhalten. In der Ruhezeit (`QUIET_HOURS`, standardmäßig
 22–6 Uhr) laufen keine automatischen Syncs, `/sync` funktioniert aber immer.
+
+### Module und Fehlzeiten (`/modules`)
+
+`/modules` fasst alle gespeicherten Termine pro Modul zusammen. Termine können unterschiedlich lang sein,
+gezählt wird deshalb in Minuten:
+
+```
+M11 Physiologie
+→ Insgesamt 8 Termine - 5320 min
+→ Maximale Fehlzeit (20%): 1064 min
+→ 🟢 Gefehlt 90 min · geplant 180 min · übrig 794 min
+→ Kommend: 5 Termine (3325 min) · noch 3 davon verpassbar
+```
+
+- **Gefehlt / geplant / übrig:** Fehlzeiten trägst du selbst ein. Bei begonnenen Terminen zählen sie als
+  „gefehlt“, bei kommenden als „geplant“. Beide gehen vom Budget ab.
+- **verpassbar:** So viele der kommenden Termine kannst du noch ganz auslassen, ohne die Grenze zu reißen.
+  Gerechnet wird mit den kürzesten Terminen zuerst.
+- **Ampel:** 🟢 mehr als die Hälfte des Budgets ist frei · 🟡 weniger als die Hälfte frei oder kein
+  weiterer Termin mehr verpassbar · 🔴 Grenze überschritten.
+- Tippst du auf ein Modul, siehst du alle seine Termine, nummeriert und mit Dauer, Art und Status
+  (✅ da · ❌ gefehlt · 🟠 teilweise · 💤 geplant · ▫️ kommend) sowie die Verteilung nach Art (VL, P, S …).
+  Ein Tipp auf eine Nummer markiert den ganzen Termin, ein zweiter Tipp nimmt die Markierung zurück.
+  Für Teil-Fehlzeiten, z. B. 30 min zu spät, schickst du `/absent M11 3 30`.
+- Module ohne kommende Termine werden ausgeblendet, mit `/modules alle` siehst du sie trotzdem.
+  Ganztägige Einträge zählen nicht mit.
+- Die Grenze stellst du mit `ABSENCE_LIMIT` in der `.env` ein (Standard `20`, in Prozent).
+  Fehlzeiten bleiben gespeichert, wenn ein Termin verlegt wird. Entfällt ein Termin, wird auch seine
+  Fehlzeit gelöscht.
 
 ### Kanal direkt in Telegram hinzufügen/entfernen
 
@@ -150,7 +183,7 @@ sudo ./install.sh                       # manuelles Update (ohne GitHub): neue D
 ```
 
 - **Passwort geändert:** Neues Passwort in `/opt/trainex-sync/.env` eintragen, dann `sudo systemctl restart trainex-sync`.
-- **Daten:** `/var/lib/trainex-sync/state.json` (Termine, Einstellungen), `/var/www/trainex/*.ics`.
+- **Daten:** `/var/lib/trainex-sync/state.json` (Termine, Einstellungen, eingetragene Fehlzeiten), `/var/www/trainex/*.ics`.
 - **Entfernen:** `sudo systemctl disable --now trainex-sync`, dann die Include-Zeile aus nginx entfernen und
   `/opt/trainex-sync`, `/var/lib/trainex-sync`, `/var/www/trainex`, `/etc/nginx/snippets/trainex.conf` und
   `/etc/systemd/system/trainex-sync.service` löschen.

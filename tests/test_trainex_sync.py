@@ -213,9 +213,18 @@ class Misc(unittest.TestCase):
 class FakeTG:
     def __init__(self):
         self.sent = []  # (chat_id, text)
+        self.markups = []
+        self.calls = []
 
-    def send(self, chat, text):
+    def send(self, chat, text, markup=None):
         self.sent.append((chat, text))
+        self.markups.append(markup)
+
+    def edit(self, chat, msg_id, text, markup=None):
+        self.send(chat, text, markup)
+
+    def call(self, method, **params):
+        self.calls.append((method, params))
 
 
 class Channels(unittest.TestCase):
@@ -259,6 +268,154 @@ class Channels(unittest.TestCase):
         app = self.make_app()
         self.assertEqual(app.channels(), [{"id": "-100555", "title": ""}])
         del os.environ["TELEGRAM_CHANNEL_ID"]
+
+
+class Modules(unittest.TestCase):
+    """/modules: Termine, Minuten und Fehlzeit-Budget pro Modul."""
+
+    def setUp(self):
+        raw = base_events()
+        # zusätzlich ein langes M11-Praktikum (240 min) und ein ganztägiger Eintrag (zählt nicht)
+        raw.append(dict(raw[0], s="20301030T080000", e="20301030T120000", k="Praktikum", t="Lang"))
+        ics = to_ics(raw).replace("END:VCALENDAR", "BEGIN:VEVENT\nSUMMARY:M11 Physiologie - Klausur\n"
+                                  "DTSTART:20301101\nDTEND:20301102\nEND:VEVENT\nEND:VCALENDAR")
+        self.events, _, _ = T.compute({}, T.parse_ics(ics), NOW)
+        self.now = dt.datetime(2030, 10, 15, 12, tzinfo=T.TZ)   # M11: 07./11./15.10. vorbei
+        self.m11 = [x for x in self.events if x["sum"].startswith("M11") and len(x["s"]) > 8]
+
+    def mod(self, absences=None, pct=20):
+        mods = T.module_stats(self.events, absences or {}, self.now, pct)
+        return {m["name"]: m for m in mods}
+
+    def test_totals_and_limit(self):
+        m = self.mod()["M11 Physiologie"]
+        self.assertEqual((m["n"], m["total"]), (6, 5 * 90 + 240))   # ganztägiger Eintrag zählt nicht
+        self.assertEqual(m["limit"], 138)                          # 20 % von 690
+        self.assertEqual((m["past"], m["up"], m["up_min"]), (3, 3, 420))
+        self.assertEqual(m["kinds"], {"VL": (5, 450), "P": (1, 240)})
+        self.assertIn("M12 Biochemie/Molekularbiologie", self.mod())
+
+    def test_absences_full_partial_planned(self):
+        ab = {self.m11[0]["uid"]: "all", self.m11[1]["uid"]: 30, self.m11[4]["uid"]: "all",
+              self.m11[2]["uid"]: 500}                              # mehr als Termindauer -> gedeckelt
+        m = self.mod(ab)["M11 Physiologie"]
+        self.assertEqual(m["missed"], 90 + 30 + 90)
+        self.assertEqual(m["planned"], 90)
+        self.assertEqual(m["rest"], 138 - 300)
+        self.assertEqual(m["skippable"], 0)
+        self.assertEqual(T.budget_icon(m), "🔴")
+        self.assertIn("überschritten um 162 min", T.budget_line(m))
+
+    def test_skippable_shortest_first(self):
+        m = self.mod(pct=50)["M11 Physiologie"]                  # Budget 345 min
+        self.assertEqual(m["skippable"], 2)                        # 90 + 90, nicht das 240-min-Praktikum
+        self.assertEqual(self.mod(pct=0)["M11 Physiologie"]["skippable"], 0)
+
+    def test_find_module(self):
+        mods = T.module_stats(self.events, {}, self.now, 20)
+        self.assertEqual([m["name"] for m in T.find_module(mods, "m11")], ["M11 Physiologie"])
+        self.assertEqual([m["name"] for m in T.find_module(mods, "anat")], ["M10 Anatomie"])
+        self.assertEqual(len(T.find_module(mods, "M1")), 3)
+        self.assertEqual(T.find_module(mods, "Chemie-Physik"), [])
+
+    def test_overview_format(self):
+        text = T.format_modules(list(self.mod().values()), 20)
+        self.assertIn("<b>M11 Physiologie</b>\n→ Insgesamt 6 Termine - 690 min\n"
+                      "→ Maximale Fehlzeit (20%): 138 min", text)
+        later = dt.datetime(2031, 1, 1, tzinfo=T.TZ)
+        mods = T.module_stats(self.events, {}, later, 20)
+        self.assertIn("4 abgeschlossene(s) Modul(e) ausgeblendet", T.format_modules(mods, 20))
+        self.assertIn("→ Abgeschlossen", T.format_modules(mods, 20, show_all=True))
+
+    def test_detail_and_keyboard(self):
+        ab = {self.m11[0]["uid"]: "all", self.m11[1]["uid"]: 30, self.m11[4]["uid"]: "all"}
+        m = self.mod(ab)["M11 Physiologie"]
+        text, first = T.format_module(m, 20, ab, self.now)
+        self.assertEqual(first, 0)
+        self.assertIn("❌ Mo 07.10. 09:45–11:15 · 90 min · VL - Thema 0 · <b>gefehlt</b>", text)
+        self.assertIn("🟠 Fr 11.10.", text)
+        self.assertIn("−30 min", text)
+        self.assertIn("💤 Mi 23.10.", text)
+        self.assertIn("fehlen geplant", text)
+        kb = T.module_keyboard(m, ab, self.now, first)["inline_keyboard"]
+        btns = [b for row in kb[:-1] for b in row]
+        self.assertEqual([b["text"] for b in btns], ["❌1", "🟠2", "3", "4", "💤5", "6"])
+        self.assertTrue(all(len(b["callback_data"].encode()) <= 64 for b in btns))
+
+    def test_detail_trimmed_when_too_long(self):
+        m = self.mod()["M11 Physiologie"]
+        text, first = T.format_module(m, 20, {}, self.now, max_len=600)
+        self.assertGreater(first, 0)
+        self.assertIn(f"… {first} frühere Termine ausgeblendet", text)
+        kb = T.module_keyboard(m, {}, self.now, first)["inline_keyboard"]
+        self.assertEqual(sum(len(r) for r in kb[:-1]), 6 - first)
+
+
+class ModuleCommands(unittest.TestCase):
+    def setUp(self):
+        os.environ["STATE_DIRECTORY"] = tempfile.mkdtemp()
+        os.environ["TELEGRAM_ADMIN_ID"] = "111"
+        os.environ["ABSENCE_LIMIT"] = "20"
+        self.app = T.App.__new__(T.App)
+        self.app.cfg = T.Cfg()
+        self.app.st = T.State(self.app.cfg)
+        self.app.tg = FakeTG()
+        # Termine in der Zukunft relativ zu „jetzt“, damit alles „kommend“ ist
+        self.app.st.d["events"], _, _ = T.compute({}, T.parse_ics(to_ics(base_events())), NOW)
+
+    def last(self):
+        return self.app.tg.sent[-1][1], self.app.tg.markups[-1]
+
+    def test_modules_overview(self):
+        self.app.handle("/modules")
+        text, kb = self.last()
+        self.assertIn("→ Insgesamt 5 Termine - 450 min", text)
+        self.assertIn("→ Maximale Fehlzeit (20%): 90 min", text)
+        self.assertEqual(len(kb["inline_keyboard"]), 4)
+
+    def test_modules_detail_and_unknown(self):
+        self.app.handle("/modules M11")
+        self.assertIn("📘 <b>M11 Physiologie</b>", self.last()[0])
+        self.app.handle("/modules M1")
+        self.assertIn("Mehrere Treffer", self.last()[0])
+        self.app.handle("/modules Chirurgie")
+        self.assertIn("Kein Modul", self.last()[0])
+
+    def test_absent_command(self):
+        ab = self.app.st.d["absences"]
+        self.app.handle("/absent M11 2 30")
+        uid2 = [x for x in self.app.st.d["events"] if x["sum"].startswith("M11")][1]["uid"]
+        self.assertEqual(ab, {uid2: 30})
+        self.assertIn("−30 min geplant", self.last()[0])
+        self.app.handle("/absent M11 2")
+        self.assertEqual(ab, {uid2: "all"})
+        self.app.handle("/absent M11 2 0")
+        self.assertEqual(ab, {})
+        self.app.handle("/absent M11 99")
+        self.assertIn("1–5", self.last()[0])
+        self.app.handle("/absent M11")
+        self.assertIn("Nutzung", self.last()[0])
+        # gespeichert
+        self.app.handle("/absent Medizinische Psychologie 1")
+        self.assertEqual(len(T.State(self.app.cfg).d["absences"]), 1)
+
+    def test_buttons_toggle(self):
+        self.app.handle("/modules")
+        key = self.last()[1]["inline_keyboard"][2][0]["callback_data"]       # M11
+        self.app.handle_callback({"id": "q1", "data": key, "message": {"chat": {"id": 111}, "message_id": 5}})
+        text, kb = self.last()
+        self.assertIn("M11 Physiologie", text)
+        toggle = kb["inline_keyboard"][0][0]["callback_data"]
+        self.app.handle_callback({"id": "q2", "data": toggle, "message": {"chat": {"id": 111}, "message_id": 5}})
+        self.assertEqual(list(self.app.st.d["absences"].values()), ["all"])
+        self.assertEqual(self.app.tg.calls[-1][1]["text"], "Fehlen geplant")
+        self.assertEqual(self.last()[1]["inline_keyboard"][0][0]["text"], "💤1")
+        self.app.handle_callback({"id": "q3", "data": toggle, "message": {"chat": {"id": 111}, "message_id": 5}})
+        self.assertEqual(self.app.st.d["absences"], {})
+        self.app.handle_callback({"id": "q4", "data": "o", "message": {"chat": {"id": 111}, "message_id": 5}})
+        self.assertIn("Module & Fehlzeiten", self.last()[0])
+        self.app.handle_callback({"id": "q5", "data": "m:deadbeef", "message": {}})
+        self.assertIn("nicht mehr", self.app.tg.calls[-1][1]["text"])
 
 
 if __name__ == "__main__":

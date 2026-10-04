@@ -10,6 +10,7 @@ Befehle:
   trainex_sync.py [--env DATEI] testmsg            Testnachricht an Admin + Kanal
 """
 import datetime as dt
+import hashlib
 import html
 import http.cookiejar
 import json
@@ -23,7 +24,7 @@ import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 
-VERSION = "1.9"
+VERSION = "1.10"
 TZ = ZoneInfo("Europe/Berlin")
 UA = f"trainex-sync/{VERSION} (private calendar sync)"
 WD = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
@@ -73,6 +74,8 @@ class Cfg:
         self.access_log = e("ACCESS_LOG", "/var/log/nginx/trainex.access.log")
         self.default_interval = int(e("DEFAULT_INTERVAL", "30"))
         self.min_interval = int(e("MIN_INTERVAL", "15"))
+        a = e("ABSENCE_LIMIT", "20").strip().rstrip("%")
+        self.absence_limit = int(a) if a.isdigit() and 0 <= int(a) <= 100 else 20
         g = e("CAMPUS_GEO", "").replace(" ", "")
         self.campus_geo = [float(x) for x in g.split(",")] if re.fullmatch(r"-?\d+\.\d+,-?\d+\.\d+", g) else None
         q = e("QUIET_HOURS", "").strip()  # z. B. "22-6"
@@ -318,10 +321,15 @@ def kind_short(kind):
     return "".join(w[0].upper() for w in re.findall(r"[A-Za-zÄÖÜäöü]{3,}", kind)) or kind
 
 
+def module_name(ev):
+    # „Biochemie/ Molekularbiologie“ -> „Biochemie/Molekularbiologie“
+    return re.sub(r"\s*/\s*", "/", split_title(ev)[0])
+
+
 def short(ev):
     """z. B. „M11 Physiologie - VL - Nierenphysiologie I“."""
-    module, kind, topic = split_title(ev)
-    module = re.sub(r"\s*/\s*", "/", module)          # „Biochemie/ Molekularbiologie“ -> „Biochemie/Molekularbiologie“
+    _, kind, topic = split_title(ev)
+    module = module_name(ev)
     if kind.startswith("Seminar") or "Seminare" in kind:
         topic = re.sub(r"^Seminar:?\s+", "", topic)
     return " - ".join(x for x in (module, kind_short(kind) if kind else "", topic) if x)
@@ -462,6 +470,196 @@ def format_entries(entries):
                 lines.append(f"{emo} {label}: {e(a)} → <b>{e(b)}</b>")
             blocks.append("\n".join(lines))
     return blocks
+
+
+# ───────────────────────── Module & Fehlzeiten ─────────────────────────
+
+def duration_min(ev):
+    """Dauer in Minuten; ganztägige Einträge zählen nicht als Unterricht."""
+    if len(ev["s"]) == 8:
+        return 0
+    return max(0, int((to_dt(ev["e"]) - to_dt(ev["s"])).total_seconds() // 60))
+
+
+def module_key(name):
+    """Kurzer, stabiler Schlüssel für Button-Daten (Telegram erlaubt max. 64 Bytes)."""
+    return hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+
+
+def uid_key(ev):
+    return ev["uid"].split("@")[0][:24]
+
+
+def absent_min(ev, absences):
+    """Gefehlte Minuten eines Termins: „all“ = ganzer Termin, Zahl = Teil (z. B. verspätet)."""
+    v = (absences or {}).get(ev["uid"])
+    if v is None:
+        return 0
+    d = duration_min(ev)
+    return d if v == "all" else max(0, min(int(v), d))
+
+
+def module_stats(events, absences, now, pct):
+    """Fasst Termine pro Modul zusammen. Begonnene Termine gelten als stattgefunden,
+    Fehlzeiten bei kommenden Terminen als „geplant“."""
+    groups = {}
+    for ev in events:
+        if duration_min(ev):
+            groups.setdefault(module_name(ev), []).append(ev)
+    out = []
+    for name in sorted(groups):
+        evs = sorted(groups[name], key=lambda x: (x["s"], x["sum"]))
+        past = [x for x in evs if to_dt(x["s"]) <= now]
+        up = [x for x in evs if to_dt(x["s"]) > now]
+        total = sum(map(duration_min, evs))
+        limit = total * pct // 100
+        missed = sum(absent_min(x, absences) for x in past)
+        planned = sum(absent_min(x, absences) for x in up)
+        rest = limit - missed - planned
+        kinds = {}
+        for x in evs:
+            k = kind_short(split_title(x)[1]) or "–"
+            n, mins = kinds.get(k, (0, 0))
+            kinds[k] = (n + 1, mins + duration_min(x))
+        # Wie viele weitere kommende Termine passen noch ins Budget (kürzeste zuerst)?
+        budget, skippable = max(rest, 0), 0
+        for d in sorted(duration_min(x) for x in up if not absent_min(x, absences)):
+            if d > budget:
+                break
+            budget -= d
+            skippable += 1
+        out.append({"name": name, "key": module_key(name), "events": evs, "n": len(evs), "total": total,
+                    "limit": limit, "past": len(past), "up": len(up), "up_min": sum(map(duration_min, up)),
+                    "missed": missed, "planned": planned, "rest": rest, "kinds": kinds,
+                    "skippable": skippable})
+    return out
+
+
+def find_module(mods, q):
+    """„M11“, „physio“ oder der volle Name; liefert alle Treffer der genauesten Stufe."""
+    ql = norm(q).lower()
+    tests = (lambda n: n == ql, lambda n: n.split()[0] == ql, lambda n: n.startswith(ql), lambda n: ql in n)
+    for test in tests:
+        hit = [m for m in mods if test(m["name"].lower())]
+        if hit:
+            return hit
+    return []
+
+
+def budget_icon(m):
+    if m["rest"] < 0:
+        return "🔴"
+    if m["rest"] * 2 < m["limit"] or (m["up"] and not m["skippable"]):
+        return "🟡"
+    return "🟢"
+
+
+def budget_line(m):
+    parts = [f"Gefehlt {m['missed']} min"]
+    if m["planned"]:
+        parts.append(f"geplant {m['planned']} min")
+    parts.append(f"übrig {m['rest']} min" if m["rest"] >= 0 else f"<b>überschritten um {-m['rest']} min</b>")
+    return f"{budget_icon(m)} " + " · ".join(parts)
+
+
+def skippable_text(m):
+    if not m["skippable"]:
+        return "<b>kein weiterer Termin verpassbar</b>"
+    return f"noch {m['skippable']} davon verpassbar"
+
+
+def event_icon(ev, absences, now):
+    d, a = duration_min(ev), absent_min(ev, absences)
+    if not a:
+        return "✅" if to_dt(ev["s"]) <= now else "▫️"
+    if to_dt(ev["s"]) > now:
+        return "💤"
+    return "❌" if a >= d else "🟠"
+
+
+def fmt_hours(mins):
+    return f"{mins // 60} h {mins % 60:02d} min"
+
+
+def format_modules(mods, pct, show_all=False):
+    if not mods:
+        return "Noch keine Termine gespeichert – erst /sync."
+    shown = [m for m in mods if m["up"] or show_all]
+    L = [f"📚 <b>Module & Fehlzeiten</b> (Grenze {pct} %)"]
+    for m in shown:
+        if m["up"]:
+            up = f"→ Kommend: {m['up']} Termine ({m['up_min']} min) · {skippable_text(m)}"
+        else:
+            up = "→ Abgeschlossen"
+        L.append("\n".join([f"<b>{e(m['name'])}</b>",
+                            f"→ Insgesamt {m['n']} Termine - {m['total']} min",
+                            f"→ Maximale Fehlzeit ({pct}%): {m['limit']} min",
+                            f"→ {budget_line(m)}", up]))
+    hidden = len(mods) - len(shown)
+    if hidden:
+        L.append(f"<i>{hidden} abgeschlossene(s) Modul(e) ausgeblendet – /modules alle</i>")
+    elif not shown:
+        L.append("Keine kommenden Termine.")
+    L.append("Tippe auf ein Modul für alle Termine und zum Eintragen von Fehlzeiten.")
+    return "\n\n".join(L)
+
+
+def modules_keyboard(mods, show_all=False):
+    rows = [[{"text": f"{budget_icon(m)} {m['name'][:40]}", "callback_data": f"m:{m['key']}"}]
+            for m in mods if m["up"] or show_all]
+    if len(rows) < len(mods) or show_all:
+        rows.append([{"text": "Nur aktuelle" if show_all else "Alle Module", "callback_data": "o" if show_all else "oa"}])
+    return {"inline_keyboard": rows}
+
+
+def event_line(i, ev, m, absences, now):
+    d, a = duration_min(ev), absent_min(ev, absences)
+    plan = " geplant" if to_dt(ev["s"]) > now else ""
+    if not a:
+        note = ""
+    elif a >= d:
+        note = " · <b>fehlen geplant</b>" if plan else " · <b>gefehlt</b>"
+    else:
+        note = f" · <b>−{a} min{plan}</b>"
+    icon = event_icon(ev, absences, now)
+    what = short(ev).removeprefix(m["name"] + " - ")
+    return f"<code>{i:>2}</code> {icon} {fmt_day(ev)} {fmt_time(ev)} · {d} min · {e(what)}{note}"
+
+
+def format_module(m, pct, absences, now, note="", max_len=3800):
+    head = ([note, ""] if note else []) + [
+        f"📘 <b>{e(m['name'])}</b>",
+        f"→ Insgesamt {m['n']} Termine - {m['total']} min ({fmt_hours(m['total'])})",
+        f"→ Maximale Fehlzeit ({pct}%): {m['limit']} min",
+        f"→ {budget_line(m)}",
+        "→ Nach Art: " + " · ".join(f"{k} {n}× ({mins} min)" for k, (n, mins) in sorted(m["kinds"].items())),
+    ]
+    if m["up"]:
+        head.append(f"→ Kommend: {m['up']} Termine · {skippable_text(m)}"
+                    + (" (kürzeste zuerst)" if m["skippable"] else ""))
+    lines = [event_line(i, ev, m, absences, now) for i, ev in enumerate(m["events"], 1)]
+    foot = ["", "✅ da · ❌ gefehlt · 🟠 teilweise · 💤 geplant · ▫️ kommend",
+            "Nummer antippen = ganzer Termin gefehlt/geplant (nochmal = zurück). "
+            f"Teilweise, z. B. 30 min zu spät: <code>/absent {e(m['name'].split()[0])} 3 30</code>"]
+    # Zu lang für eine Nachricht: älteste Termine zusammenfassen
+    first = 0
+    while first < len(lines) - 1 and len("\n".join(head + [""] + lines[first:] + foot)) > max_len:
+        first += 1
+    body = ([f"<i>… {first} frühere Termine ausgeblendet</i>"] if first else []) + lines[first:]
+    return "\n".join(head + [""] + body + foot), first
+
+
+def module_keyboard(m, absences, now, first=0):
+    btns = []
+    for i, ev in enumerate(m["events"], 1):
+        if i <= first:
+            continue
+        mark = event_icon(ev, absences, now) if absent_min(ev, absences) else ""
+        btns.append({"text": f"{mark}{i}", "callback_data": f"t:{m['key']}:{uid_key(ev)}"})
+    btns = btns[-90:]  # Telegram begrenzt die Anzahl der Buttons
+    rows = [btns[i:i + 6] for i in range(0, len(btns), 6)]
+    rows.append([{"text": "« Übersicht", "callback_data": "o"}])
+    return {"inline_keyboard": rows}
 
 
 # ───────────────────────── iCal schreiben ─────────────────────────
@@ -690,6 +888,7 @@ class State:
         s.setdefault("token", "")
         s.setdefault("channels", [])
         self.d.setdefault("fails", 0)
+        self.d.setdefault("absences", {})  # uid -> "all" | Minuten
 
     def save(self):
         write_atomic(self.path, json.dumps(self.d, ensure_ascii=False, indent=1).encode("utf-8"), 0o600)
@@ -721,8 +920,9 @@ class TG:
             raise RuntimeError(f"Telegram {method}: {res.get('description')}")
         return res["result"]
 
-    def send(self, chat, text):
-        """Sendet HTML-Text, teilt bei Bedarf an Absatzgrenzen (Limit 4096)."""
+    def send(self, chat, text, markup=None):
+        """Sendet HTML-Text, teilt bei Bedarf an Absatzgrenzen (Limit 4096).
+        Buttons (markup) hängen an der letzten Teilnachricht."""
         if not chat:
             return
         chunks, cur = [], ""
@@ -731,15 +931,27 @@ class TG:
                 chunks.append(cur); cur = ""
             cur = f"{cur}\n\n{part}" if cur else part
         chunks.append(cur)
-        for c in chunks:
+        for i, c in enumerate(chunks):
+            extra = {"reply_markup": markup} if markup and i == len(chunks) - 1 else {}
             for attempt in range(3):
                 try:
                     self.call("sendMessage", chat_id=chat, text=c[:4096], parse_mode="HTML",
-                              disable_web_page_preview=True)
+                              disable_web_page_preview=True, **extra)
                     break
                 except Exception as ex:
                     log("Telegram-Sendefehler:", ex)
                     time.sleep(2 * (attempt + 1))
+
+    def edit(self, chat, msg_id, text, markup=None):
+        """Ersetzt eine Nachricht (für Buttons). Zu lange Texte gehen als neue Nachricht raus."""
+        if len(text) > 4096:
+            return self.send(chat, text, markup)
+        try:
+            self.call("editMessageText", chat_id=chat, message_id=msg_id, text=text, parse_mode="HTML",
+                      disable_web_page_preview=True, reply_markup=markup or {"inline_keyboard": []})
+        except RuntimeError as ex:
+            if "not modified" not in str(ex):
+                raise
 
 
 # ───────────────────────── Sync-Kern ─────────────────────────
@@ -825,6 +1037,9 @@ class App:
         recovered = self.st.d["fails"] > 0
         self.st.d["fails"] = 0
         self.st.d["events"] = events
+        # Fehlzeiten zu entfallenen Terminen verwerfen
+        uids = {x["uid"] for x in events}
+        self.st.d["absences"] = {k: v for k, v in self.st.d["absences"].items() if k in uids}
         n_up = sum(1 for x in events if not is_past(x, now))
         run.update(ok=True, dur=time.time() - t0, count=len(new), changes=len(entries),
                    msg=f"{len(entries)} Änderung(en)" if entries else "keine Änderungen")
@@ -935,6 +1150,93 @@ class App:
             L += ["", "<b>Zuletzt geändert:</b>", "\n\n".join(lc["preview"])]
         return "\n".join(L)
 
+    # ── Module & Fehlzeiten ──
+    def modules(self):
+        return module_stats(self.st.d["events"], self.st.d["absences"], dt.datetime.now(TZ),
+                            self.cfg.absence_limit)
+
+    def modules_view(self, show_all=False):
+        mods = self.modules()
+        return format_modules(mods, self.cfg.absence_limit, show_all), modules_keyboard(mods, show_all)
+
+    def module_view(self, m, note=""):
+        ab, now = self.st.d["absences"], dt.datetime.now(TZ)
+        text, first = format_module(m, self.cfg.absence_limit, ab, now, note)
+        return text, module_keyboard(m, ab, now, first)
+
+    def pick_module(self, q):
+        """Liefert (Modul, None) oder (None, Fehlermeldung)."""
+        hits = find_module(self.modules(), q)
+        if len(hits) == 1:
+            return hits[0], None
+        if not hits:
+            return None, f"Kein Modul zu „{e(q)}“ gefunden. Übersicht: /modules"
+        return None, "Mehrere Treffer – bitte genauer:\n" + "\n".join(f"• {e(m['name'])}" for m in hits)
+
+    def cmd_absent(self, args):
+        """/absent <Modul> <Nr> [Minuten] – ohne Minuten: ganzer Termin, 0: Eintrag löschen."""
+        nums = []
+        while args and args[-1].isdigit() and len(nums) < 2:
+            nums.insert(0, int(args.pop()))
+        if not args or not nums:
+            self.notify_admin("Nutzung: <code>/absent &lt;Modul&gt; &lt;Nr&gt; [Minuten]</code>\n"
+                              "z. B. <code>/absent M11 3</code> (ganzer Termin) oder "
+                              "<code>/absent M11 3 30</code> (30 min). 0 Minuten löscht den Eintrag.\n"
+                              "Die Nummern stehen in <code>/modules M11</code>.")
+            return
+        m, err = self.pick_module(" ".join(args))
+        if err:
+            self.notify_admin(err)
+            return
+        nr, mins = nums[0], (nums[1] if len(nums) > 1 else None)
+        if not 1 <= nr <= m["n"]:
+            self.notify_admin(f"{e(m['name'])} hat die Termine 1–{m['n']}.")
+            return
+        ev, ab = m["events"][nr - 1], self.st.d["absences"]
+        if mins == 0:
+            ab.pop(ev["uid"], None)
+            note = f"🗑 Nr. {nr}: Fehlzeit gelöscht."
+        elif mins is None or mins >= duration_min(ev):
+            ab[ev["uid"]] = "all"
+            note = f"✏️ Nr. {nr}: ganzer Termin ({duration_min(ev)} min) eingetragen."
+        else:
+            ab[ev["uid"]] = mins
+            note = f"✏️ Nr. {nr}: {mins} min eingetragen."
+        self.st.save()
+        m, _ = self.pick_module(m["name"])
+        self.tg.send(self.cfg.admin, *self.module_view(m, note))
+
+    def handle_callback(self, cq):
+        """Buttons unter /modules: o/oa = Übersicht, m:<Modul> = Details, t:<Modul>:<Termin> = Fehlzeit umschalten."""
+        data = cq.get("data") or ""
+        msg = cq.get("message") or {}
+        toast = ""
+        if data in ("o", "oa"):
+            text, kb = self.modules_view(show_all=(data == "oa"))
+        else:
+            kind, _, rest = data.partition(":")
+            key, _, uk = rest.partition(":")
+            m = next((x for x in self.modules() if x["key"] == key), None)
+            if not m:
+                self.tg.call("answerCallbackQuery", callback_query_id=cq["id"],
+                             text="Modul nicht mehr im Plan – /modules")
+                return
+            if kind == "t":
+                ev = next((x for x in m["events"] if uid_key(x) == uk), None)
+                if ev:
+                    ab = self.st.d["absences"]
+                    if ab.pop(ev["uid"], None) is not None:
+                        toast = "Fehlzeit entfernt"
+                    else:
+                        ab[ev["uid"]] = "all"
+                        toast = ("Als gefehlt markiert" if to_dt(ev["s"]) <= dt.datetime.now(TZ)
+                                 else "Fehlen geplant")
+                    self.st.save()
+                    m = next(x for x in self.modules() if x["key"] == key)
+            text, kb = self.module_view(m)
+        self.tg.edit((msg.get("chat") or {}).get("id", self.cfg.admin), msg.get("message_id"), text, kb)
+        self.tg.call("answerCallbackQuery", callback_query_id=cq["id"], text=toast)
+
     # ── Befehle ──
     HELP = ("🤖 <b>Befehle</b>\n"
             "/sync – jetzt abgleichen (/sync force: Löschschutz übergehen)\n"
@@ -945,6 +1247,10 @@ class App:
             "/url – Abo-URL anzeigen\n"
             "/newurl – neue geheime Abo-URL erzeugen (alte wird ungültig)\n"
             "/channels – registrierte Kanäle anzeigen\n"
+            "/modules – Module mit Terminen, Minuten und Fehlzeit-Budget\n"
+            "/modules &lt;Modul&gt; – alle Termine eines Moduls (z. B. /modules M11)\n"
+            "/modules alle – auch abgeschlossene Module\n"
+            "/absent &lt;Modul&gt; &lt;Nr&gt; [min] – Fehlzeit eintragen (0 = löschen)\n"
             "/help – diese Hilfe\n\n"
             "📡 <b>Kanal hinzufügen/entfernen</b>\n"
             "Bot als Admin in den Kanal holen, dann direkt im Kanal <code>/addchannel</code> posten "
@@ -1009,6 +1315,18 @@ class App:
             else:
                 self.notify_admin("Kein Kanal registriert. Bot als Admin in einen Kanal holen und dort "
                                   "/addchannel posten.")
+        elif cmd == "/modules":
+            q = " ".join(parts[1:])
+            if q and q.lower() not in ("alle", "all"):
+                m, err = self.pick_module(q)
+                if err:
+                    self.notify_admin(err)
+                else:
+                    self.tg.send(self.cfg.admin, *self.module_view(m))
+            else:
+                self.tg.send(self.cfg.admin, *self.modules_view(show_all=bool(q)))
+        elif cmd == "/absent":
+            self.cmd_absent(parts[1:])
         elif cmd == "/help":
             self.notify_admin(self.HELP)
         else:
@@ -1059,6 +1377,7 @@ class App:
                     ("start", "Auto-Sync einschalten"), ("stop", "Auto-Sync ausschalten"),
                     ("settime", "Intervall in Minuten setzen"), ("url", "Abo-URL"),
                     ("newurl", "Neue Abo-URL erzeugen"), ("channels", "Registrierte Kanäle anzeigen"),
+                    ("modules", "Module & Fehlzeiten"), ("absent", "Fehlzeit eintragen"),
                     ("help", "Hilfe")]],
                 scope={"type": "chat", "chat_id": int(c.admin)})
         except Exception as ex:
@@ -1088,7 +1407,7 @@ class App:
             if self.st.settings["auto"]:
                 wait = int(max(1, min(50, self.next_run - now)))
             try:
-                params = {"timeout": wait, "allowed_updates": ["message", "channel_post"]}
+                params = {"timeout": wait, "allowed_updates": ["message", "channel_post", "callback_query"]}
                 if offset is not None:
                     params["offset"] = offset
                 updates = self.tg.call("getUpdates", http_timeout=wait + 15, **params)
@@ -1098,6 +1417,16 @@ class App:
                 continue
             for u in updates:
                 offset = u["update_id"] + 1
+                cq = u.get("callback_query")
+                if cq:
+                    if str((cq.get("from") or {}).get("id")) != c.admin:
+                        log("Button von fremdem Nutzer ignoriert:", (cq.get("from") or {}).get("id"))
+                        continue
+                    try:
+                        self.handle_callback(cq)
+                    except Exception as ex:
+                        log("Fehler bei Button:", repr(ex))
+                    continue
                 cp = u.get("channel_post")
                 if cp:
                     try:
