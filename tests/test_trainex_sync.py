@@ -2,7 +2,9 @@
 
 Ausführen:  python3 -m unittest discover -s tests -v
 """
+import contextlib
 import datetime as dt
+import io
 import os
 import sys
 import tempfile
@@ -416,6 +418,36 @@ class ModuleCommands(unittest.TestCase):
         self.assertIn("Module & Fehlzeiten", self.last()[0])
         self.app.handle_callback({"id": "q5", "data": "m:deadbeef", "message": {}})
         self.assertIn("nicht mehr", self.app.tg.calls[-1][1]["text"])
+
+
+class Startup(unittest.TestCase):
+    def test_start_line_before_telegram(self):
+        """Der Deploy wartet nur wenige Sekunden auf „gestartet“ – hängende Telegram-Aufrufe dürfen das nicht verzögern."""
+        class Stop(BaseException):
+            pass
+
+        out = io.StringIO()
+
+        class SlowTG(FakeTG):
+            def call(self, method, **params):
+                self.calls.append((method, "gestartet" in out.getvalue()))
+                if method == "getUpdates":
+                    raise Stop()
+                raise RuntimeError("Telegram-Timeout")
+
+        for k, v in {"STATE_DIRECTORY": tempfile.mkdtemp(), "WEB_DIR": tempfile.mkdtemp(),
+                     "TELEGRAM_ADMIN_ID": "111", "TRAINEX_USER": "u", "TRAINEX_PASS": "p",
+                     "TELEGRAM_BOT_TOKEN": "t", "ICS_TOKEN": "x"}.items():
+            os.environ[k] = v
+        app = T.App(T.Cfg())
+        app.st.d["version"] = "0.1"
+        app.st.settings["auto"] = False
+        app.tg = SlowTG()
+        with contextlib.redirect_stdout(out), self.assertRaises(Stop):
+            app.run()
+        self.assertIn(f"trainex-sync {T.VERSION} gestartet", out.getvalue())
+        self.assertEqual(app.tg.calls[0], ("setMyCommands", True))
+        self.assertIn("aktualisiert", app.tg.sent[0][1])
 
 
 if __name__ == "__main__":
