@@ -1370,8 +1370,14 @@ class App:
         os.makedirs(c.web_dir, exist_ok=True)
         if self.st.d["events"]:
             self.publish()
+        last = (self.st.d.get("last_run") or {}).get("time", 0)
+        self.next_run = max(time.time() + 5, last + self.st.settings["interval"] * 60)
+        # Startmeldung vor allen Telegram-Aufrufen: der Deploy wartet nur wenige Sekunden auf diese Zeile,
+        # und Telegram antwortet vom Server aus manchmal erst nach dem Timeout.
+        log(f"trainex-sync {VERSION} gestartet. Auto={self.st.settings['auto']}, "
+            f"Intervall={self.st.settings['interval']} min")
         try:
-            self.tg.call("setMyCommands", commands=[
+            self.tg.call("setMyCommands", http_timeout=10, commands=[
                 {"command": k, "description": v} for k, v in [
                     ("sync", "Jetzt abgleichen"), ("status", "Status anzeigen"),
                     ("start", "Auto-Sync einschalten"), ("stop", "Auto-Sync ausschalten"),
@@ -1382,16 +1388,12 @@ class App:
                 scope={"type": "chat", "chat_id": int(c.admin)})
         except Exception as ex:
             log("setMyCommands:", ex)
-        last = (self.st.d.get("last_run") or {}).get("time", 0)
-        self.next_run = max(time.time() + 5, last + self.st.settings["interval"] * 60)
         if self.st.d.get("version") != VERSION:
             prev = self.st.d.get("version")
             self.st.d["version"] = VERSION
             self.st.save()
             if prev:
                 self.notify_admin(f"🚀 trainex-sync aktualisiert: v{e(prev)} → <b>v{VERSION}</b>")
-        log(f"trainex-sync {VERSION} gestartet. Auto={self.st.settings['auto']}, "
-            f"Intervall={self.st.settings['interval']} min")
         offset = None
         while True:
             now = time.time()
