@@ -36,12 +36,12 @@ FORM = """<form name="filter" action="archiv_liste.cfm?TokCF19=0T0123&amp;kurs=7
 LIST = """<table>
 <tr><th>Datei</th><th>Datum</th><th>Größe</th></tr>
 <tr><td colspan=3><b>M11 Physiologie</b></td></tr>
-<tr><td><a href="download.cfm?TokCF19=0T0123&amp;datei_id=501" target=_blank>Skript Niere</a></td>
+<tr><td><a href="datei_laden.cfm?DID=501&amp;Filename=Skript_Niere.pdf&amp;did_sec=6156566" target=_blank>Skript Niere</a></td>
     <td>02.10.2026</td><td>1,2 MB</td></tr>
-<tr><td><a href="javascript:void(0)" onclick="window.open('download.cfm?datei_id=502&amp;TokCF19=0T0999')">
+<tr><td><a href="javascript:void(0)" onclick="window.open('datei_laden.cfm?DID=502&amp;Filename=VL3_Herz.pdf&amp;did_sec=6168854')">
     <img src="pdf.gif"></a> VL3_Herz.pdf</td><td>03.10.2026</td></tr>
 <tr><td colspan=3>M12 Biochemie</td></tr>
-<tr><td><a href="/hmu24/upload/archiv/Enzyme.pptx">Enzyme</a> <a href="/hmu24/upload/archiv/Enzyme.pptx">Download</a></td>
+<tr><td><a href="/hmu24/upload/archiv/Enzyme.pptx">Übung Enzyme</a> <a href="/hmu24/upload/archiv/Enzyme.pptx">Download</a></td>
     <td>01.10.2026</td></tr>
 <tr><td><a href="archiv_liste.cfm?sort=name">sortieren</a></td></tr>
 </table>"""
@@ -52,10 +52,11 @@ class Parse(unittest.TestCase):
         docs = T.parse_archive(FORM + LIST, "https://x.de/hmu24/cfm/archiv/archiv_liste.cfm?TokCF19=1")
         self.assertEqual([(d["folder"], d["title"]) for d in docs],
                          [("M11 Physiologie", "Skript Niere"), ("M11 Physiologie", "VL3_Herz.pdf"),
-                          ("M12 Biochemie", "Enzyme")])
-        self.assertEqual(docs[0]["key"], "/hmu24/cfm/archiv/download.cfm?datei_id=501")  # ohne Tokens
+                          ("M12 Biochemie", "Übung Enzyme")])
+        self.assertEqual(docs[0]["key"], "/hmu24/cfm/archiv/datei_laden.cfm?DID=501&Filename=Skript_Niere.pdf"
+                                         "&did_sec=6156566")
         self.assertEqual(docs[0]["info"], "02.10.2026 1,2 MB")
-        self.assertTrue(docs[1]["url"].startswith("https://x.de/hmu24/cfm/archiv/download.cfm?datei_id=502"))
+        self.assertTrue(docs[1]["url"].startswith("https://x.de/hmu24/cfm/archiv/datei_laden.cfm?DID=502"))
 
     def test_canon_and_tok(self):
         self.assertEqual(T.canon_url("/a/b.cfm?TokCF19=0T01&IDphp17=3P1&sec18m=7S&123456&id=5"), "/a/b.cfm?id=5")
@@ -69,32 +70,107 @@ class Parse(unittest.TestCase):
         self.assertEqual(T.display_name("Download", "pdf", "orig.pdf"), "orig.pdf")
 
 
+# Aufbau wie im echten TraiNex-Archiv (cfm/archiv/ausgabe.cfm, ISO-8859-1, drei Formulare)
+REAL_FORMS = """<form method="post" action="ausgabe.cfm?1791197979833&TokCF19=0T1&IDphp17=3P9&sec18m=7S9">
+Nur letzte <input type="text" name="nur_x" value="30" size=2> Tage <input type="submit" name="submitTage" value="anzeigen">
+</form>
+<form method="post" action="ausgabe.cfm?1791197979833&TokCF19=0T1&IDphp17=3P9&sec18m=7S9">
+Nur <select name="stuSem"{title}><option value="1">1.<option value="2">2.<option value="3"{sel3}>3.
+<option value="0">alle</select> Semester <input type="submit" name="submitSemester" value=" anzeigen ">
+</form>
+<form method="post" action="ausgabe.cfm?1791197979833&TokCF19=0T1&IDphp17=3P9&sec18m=7S9">
+<input type="text" name="search" value=""> <input type="submit" name="reset" value="alle anzeigen">
+</form>"""
+
+
+def real_forms(title=' title="3. Semester: 01.10.2026 bis 31.03.2027"', sel3=" selected"):
+    return REAL_FORMS.replace("{title}", title).replace("{sel3}", sel3)
+
+
 class Form(unittest.TestCase):
     URL = "https://x.de/hmu24/cfm/archiv/archiv.cfm?TokCF19=1"
+    AUSGABE = "https://x.de/hmu24/cfm/archiv/ausgabe.cfm?TokCF19=1"
 
-    def test_picks_current_semester_and_nur(self):
-        method, url, data, label, preset = T.semester_form(FORM.encode(), self.URL, TODAY)
+    def test_synthetic_radio_form(self):
+        method, url, data, label = T.semester_form(FORM.encode(), self.URL, TODAY)
         self.assertEqual(method, "POST")
         self.assertEqual(url, "https://x.de/hmu24/cfm/archiv/archiv_liste.cfm?TokCF19=0T0123&kurs=7")
-        self.assertEqual(label, "3. Semester: 01.10.2026 bis 31.03.2027")
+        self.assertEqual(label, "3. Semester")
         self.assertEqual(urllib.parse.parse_qs(data.decode()),
                          {"semester": ["3"], "sort": ["datum"], "kurs": ["77"], "zeitraum": ["sem"],
                           "anzeigen": ["anzeigen"]})
-        self.assertFalse(preset)
+
+    def test_real_form(self):
+        method, url, data, label = T.semester_form(real_forms(), self.AUSGABE, TODAY)
+        self.assertEqual((method, label), ("POST", "3. Semester"))
+        self.assertTrue(url.startswith("https://x.de/hmu24/cfm/archiv/ausgabe.cfm?1791197979833&TokCF19="))
+        self.assertEqual(urllib.parse.parse_qsl(data.decode(), keep_blank_values=True),
+                         [("stuSem", "3"), ("submitSemester", " anzeigen ")])
+
+    def test_real_form_semester_choice(self):
+        # Zeitraum im title schlägt die Vorauswahl
+        f = real_forms(' title="2. Semester: 01.04.2026 bis 30.09.2026"', "")
+        self.assertIsNone(T.semester_form(f.replace("2. Semester: 01.04.2026 bis 30.09.2026", "x"),
+                                          self.AUSGABE, TODAY))  # weder Zeitraum noch Vorauswahl
+        self.assertEqual(T.semester_form(f, self.AUSGABE, dt.date(2026, 5, 1))[3], "2. Semester")
+        # Hinweis irgendwo auf der Seite
+        page = "<p>(3. Semester: 01.10.2026 bis 31.03.2027)</p>" + real_forms("", "")
+        self.assertEqual(T.semester_form(page, self.AUSGABE, TODAY)[3], "3. Semester")
+        # nur Vorauswahl
+        self.assertEqual(T.semester_form(real_forms("", " selected"), self.AUSGABE, TODAY)[3], "3. Semester")
+        # fest eingestellt, „alle“ nie
+        self.assertEqual(T.semester_form(real_forms(), self.AUSGABE, TODAY, "1")[2], b"stuSem=1&submitSemester=+anzeigen+")
+        self.assertIsNone(T.semester_form(real_forms(), self.AUSGABE, TODAY, "0"))
 
     def test_by_number_and_missing(self):
-        self.assertTrue(T.semester_form(FORM, self.URL, TODAY, "4")[3].startswith("4. Semester"))
+        self.assertEqual(T.semester_form(FORM, self.URL, TODAY, "4")[3], "4. Semester")
         self.assertIsNone(T.semester_form(FORM, self.URL, dt.date(2030, 1, 1)))
         self.assertIsNone(T.semester_form("<form><select name=a><option>x</select></form>", self.URL, TODAY))
 
-    def test_get_form_preset(self):
-        f = FORM.replace('method="post"', "").replace('value="3">', 'value="3" selected>') \
-                .replace('value="alle" checked', 'value="alle"').replace('value="sem">', 'value="sem" checked>')
-        method, url, data, _, preset = T.semester_form(f, self.URL, TODAY)
+    def test_get_form(self):
+        f = FORM.replace('method="post"', "")
+        method, url, data, _ = T.semester_form(f, self.URL, TODAY)
         self.assertEqual(method, "GET")
         self.assertIsNone(data)
         self.assertIn("archiv_liste.cfm?semester=3", url)
-        self.assertTrue(preset)
+
+    def test_trainex_links(self):
+        page = ('<table><tr><td><b>M07 Berufsfelderkundung</b></td></tr><tr><td>'
+                '<a href="datei_laden.cfm?DID=22070&amp;Filename=Einfuehrung_M07.pdf&amp;did_sec=271196438">'
+                '<img src="pdf.gif"></a></td><td>Einführung M07</td></tr></table>')
+        d = T.parse_archive(page, self.AUSGABE)[0]
+        self.assertEqual((d["title"], d["folder"]), ("Einfuehrung_M07.pdf", "M07 Berufsfelderkundung"))
+        self.assertEqual(d["key"], "/hmu24/cfm/archiv/datei_laden.cfm?DID=22070&Filename=Einfuehrung_M07.pdf"
+                                   "&did_sec=271196438")
+        self.assertEqual(T.url_filename(d["url"]), "Einfuehrung_M07.pdf")
+
+
+class ArchiveCache(unittest.TestCase):
+    def test_stale_cache_falls_back(self):
+        os.environ["TRAINEX_BASE"] = "https://x.de/hmu24"
+        cfg = T.Cfg()
+        os.environ.pop("TRAINEX_BASE")
+        calls = []
+
+        class H(dict):
+            def get_content_charset(self):
+                return "iso-8859-1"
+
+        def req(step, url, data=None, extra=None):
+            calls.append(step)
+            if "Navigation" in step:
+                return 200, H(), b'<frame src="../cfm/archiv/ausgabe.cfm?TokCF19=1">'
+            return 200, H(), (real_forms() + LIST).encode("iso-8859-1")
+        cache = {"method": "POST", "url": "/hmu24/cfm/archiv/ausgabe.cfm", "data": "stuSem=2&submitSemester=x",
+                 "label": "2. Semester"}
+        listing, label, _, new_cache = T.fetch_archive(cfg, req, TODAY, cache)
+        self.assertEqual(calls, ["D3 anzeigen (direkt)", "D1 Archiv (Navigation)", "D2 Archiv", "D3 anzeigen"])
+        self.assertEqual((label, len(listing)), ("3. Semester", 3))
+        self.assertEqual(new_cache, {"method": "POST", "url": "/hmu24/cfm/archiv/ausgabe.cfm",
+                                     "data": "stuSem=3&submitSemester=+anzeigen+", "label": "3. Semester"})
+        calls.clear()
+        T.fetch_archive(cfg, req, TODAY, new_cache)
+        self.assertEqual(calls, ["D3 anzeigen (direkt)"])
 
 
 def listing(*specs):
@@ -289,8 +365,12 @@ class Announce(unittest.TestCase):
 
 # ───────── Ende-zu-Ende gegen einen nachgebauten TraiNex ─────────
 
+OLD_DOC = """<table><tr><td>M01 Altes Modul</td></tr>
+<tr><td><a href="datei_laden.cfm?DID=100&amp;Filename=Alt.pdf&amp;did_sec=1">Alt</a></td></tr></table>"""
+
+
 class FakeTrainex(http.server.BaseHTTPRequestHandler):
-    files = {"501": b"%PDF-1.4 Niere v1", "502": b"%PDF-1.4 Herz"}
+    files = {"501": b"%PDF-1.4 Niere v1", "502": b"%PDF-1.4 Herz", "100": b"%PDF alt"}
     log = []
 
     def log_message(self, *a):
@@ -310,10 +390,14 @@ class FakeTrainex(http.server.BaseHTTPRequestHandler):
         data = urllib.parse.parse_qs(self.rfile.read(n).decode())
         path = urllib.parse.urlsplit(self.path).path
         self.log.append(("POST", path, data))
-        if path.endswith("archiv_liste.cfm"):
-            ok = data.get("zeitraum") == ["sem"] and data.get("semester") == ["3"]
-            return self.reply((LIST if ok else "<p>Alle Semester</p>").encode())
+        if path.endswith("ausgabe.cfm"):
+            if data.get("submitSemester") == [" anzeigen "] and data.get("stuSem") == ["3"]:
+                return self.archive(LIST)
+            return self.archive(OLD_DOC + LIST)
         self.reply(b"<p>Willkommen</p>")
+
+    def archive(self, listing):
+        self.reply((real_forms() + listing).encode("iso-8859-1"), "text/html;charset=iso-8859-1")
 
     def do_GET(self):
         u = urllib.parse.urlsplit(self.path)
@@ -329,14 +413,14 @@ class FakeTrainex(http.server.BaseHTTPRequestHandler):
         if p.endswith("einsatzplan_listenansicht_iCal.cfm"):
             return self.reply(to_ics(base_events()).encode(), "text/calendar")
         if p.endswith("student_layout.cfm") and q.get("subarea") == ["archiv"]:
-            return self.reply(b'<frameset><frame src="menu.cfm"><frame src="../cfm/archiv/archiv.cfm?TokCF19=1">'
+            return self.reply(b'<frameset><frame src="menu.cfm"><frame src="../cfm/archiv/ausgabe.cfm?TokCF19=1">'
                               b'</frameset>')
-        if p.endswith("archiv.cfm"):
-            return self.reply(FORM.encode())
-        if p.endswith("download.cfm"):
-            i = q["datei_id"][0]
+        if p.endswith("ausgabe.cfm"):  # ungefiltert: alle Semester
+            return self.archive(OLD_DOC + LIST)
+        if p.endswith("datei_laden.cfm"):
+            i = q["DID"][0]
             return self.reply(self.files[i], "application/pdf",
-                              {"Content-Disposition": f'attachment; filename="datei{i}.pdf"'})
+                              {"Content-Disposition": f'attachment; filename="{q["Filename"][0]}"'})
         if p.endswith("Enzyme.pptx"):
             return self.reply(b"PK pptx", "application/octet-stream")
         self.reply(b"<p>ok</p>")
@@ -373,7 +457,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(len(logins), 1)
         docs = self.app.st.d["docs"]
         self.assertEqual(sorted(x["name"] for x in docs["items"].values()),
-                         ["Enzyme.pptx", "Skript Niere.pdf", "VL3_Herz.pdf"])
+                         ["Skript Niere.pdf", "VL3_Herz.pdf", "Übung Enzyme.pptx"])
         store = os.path.join(self.app.docs_dir(), "f")
         self.assertEqual(len(os.listdir(store)), 3)
         with open(os.path.join(self.app.docs_dir(), "index.json"), encoding="utf-8") as f:
@@ -381,10 +465,12 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(feed["files"][0]["path"], "M11 Physiologie/Skript Niere.pdf")
         self.assertEqual(self.app.tg.docs, [])  # Erstimport: nichts im Kanal
 
-        # zweiter Lauf: unverändert → keine Downloads
+        # zweiter Lauf: unverändert → keine Downloads, Archiv direkt mit einem Abruf
         FakeTrainex.log.clear()
         self.app.sync()
-        self.assertFalse([x for x in FakeTrainex.log if "download" in x[1] or x[1].endswith(".pptx")])
+        self.assertFalse([x for x in FakeTrainex.log if "datei_laden" in x[1] or x[1].endswith(".pptx")])
+        archive = [x for x in FakeTrainex.log if "archiv" in x[1] or x[2].get("subarea") == ["archiv"]]
+        self.assertEqual([(m, p.rsplit("/", 1)[-1]) for m, p, _ in archive], [("POST", "ausgabe.cfm")])
         self.assertEqual(self.app.tg.docs, [])
 
         # neue Fassung von 501 (anderes Datum in der Liste) → genau ein Download, Meldung im Kanal
@@ -399,7 +485,7 @@ class EndToEnd(unittest.TestCase):
             LIST = old_list
             FakeTrainex.files["501"] = b"%PDF-1.4 Niere v1"
         self.assertEqual(run["docs"], "1 geändert")
-        self.assertEqual(len([x for x in FakeTrainex.log if "download" in x[1]]), 1)
+        self.assertEqual(len([x for x in FakeTrainex.log if "datei_laden" in x[1]]), 1)
         self.assertEqual([(c, f) for c, _, _, f, _ in self.app.tg.docs], [(-5, "Skript Niere.pdf")])
         self.assertEqual(len(os.listdir(store)), 3)  # alte Fassung gelöscht
 

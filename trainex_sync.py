@@ -1061,6 +1061,15 @@ def _is_header(text):
     return len(text) <= 80 and len(HEADER_WORDS.findall(text)) >= max(2, len(words) // 2)
 
 
+def url_filename(url):
+    """Dateiname aus dem Link: letzter Pfadteil oder ein Parameter wie Filename=…pdf (TraiNex: datei_laden.cfm)."""
+    p = urllib.parse.urlsplit(url)
+    for c in [urllib.parse.unquote(p.path.rsplit("/", 1)[-1])] + [v for _, v in urllib.parse.parse_qsl(p.query)]:
+        if _ext(c) in DOC_EXT:
+            return c
+    return ""
+
+
 def doc_title(link_text, title_attr, row_text, url):
     for c in (link_text, title_attr):
         if not _generic(c):
@@ -1068,10 +1077,7 @@ def doc_title(link_text, title_attr, row_text, url):
     m = re.search(r"[^\s/\\<>|]+\.(?:%s)\b" % "|".join(sorted(DOC_EXT)), row_text, re.I)
     if m:
         return m.group(0)
-    tail = urllib.parse.unquote(urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1])
-    if _ext(tail) in DOC_EXT:
-        return tail
-    return row_text[:80] or "Dokument"
+    return url_filename(url) or row_text[:80] or "Dokument"
 
 
 def parse_archive(body, page_url):
@@ -1110,27 +1116,55 @@ def parse_archive(body, page_url):
     return docs
 
 
-def pick_semester(options, today, want=""):
-    """options: [(value, label)]. Ohne want das Semester, dessen Zeitraum heute enthält,
-    sonst das Semester mit dieser Nummer (DOCS_SEMESTER=3 → „3. Semester“)."""
-    for v, label in options:
-        if want:
-            if re.search(r"(?<!\d)%s\.\s*Semester" % re.escape(want), label, re.I) or label == want:
-                return v, label
-            continue
-        m = SEM_RANGE.search(label)
-        if m:
-            a = dt.date(int(m[3]), int(m[2]), int(m[1]))
-            z = dt.date(int(m[6]), int(m[5]), int(m[4]))
-            if a <= today <= z:
-                return v, label
+def _sem_num(label):
+    """„3.“ / „3. Semester“ / „3. Semester: 01.10.2026 bis …“ → 3; „alle“ → None."""
+    m = re.match(r"\s*(\d{1,2})\s*\.?\s*(?:Semester\b|:|$)", label, re.I)
+    return int(m.group(1)) if m else None
+
+
+def _in_range(m, today):
+    a = dt.date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    z = dt.date(int(m.group(6)), int(m.group(5)), int(m.group(4)))
+    return a <= today <= z
+
+
+def semester_hint(text, today):
+    """Nummer aus einem Hinweis wie „3. Semester: 01.10.2026 bis 31.03.2027“, dessen Zeitraum heute enthält."""
+    for m in re.finditer(r"(\d{1,2})\.\s*Semester[^0-9<]{0,12}(" + SEM_RANGE.pattern + ")", text, re.I):
+        if _in_range(SEM_RANGE.search(m.group(2)), today):
+            return int(m.group(1))
     return None
 
 
+def pick_semester(options, today, want="", page=""):
+    """options: [(value, label, selected, attrs)]. Reihenfolge: DOCS_SEMESTER; Option, deren Zeitraum
+    (im Text oder z. B. im title) heute enthält; Zeitraum-Hinweis irgendwo auf der Seite; Vorauswahl.
+    Liefert (value, „3. Semester“) oder None. „alle“ wird nie gewählt."""
+    opts = [(v, _sem_num(lab) or (int(v) if v.isdigit() and _sem_num(lab + ".") else None), sel, lab + " " + a)
+            for v, lab, sel, a in options]
+    opts = [o for o in opts if o[1]]
+    found = None
+    if want:
+        found = next((o for o in opts if str(o[1]) == want or o[0] == want), None)
+    else:
+        for o in opts:
+            m = SEM_RANGE.search(html.unescape(o[3]))
+            if m and _in_range(m, today):
+                found = o
+                break
+        if not found:
+            n = semester_hint(html.unescape(page), today)
+            found = next((o for o in opts if o[1] == n), None) if n else None
+        if not found:
+            found = next((o for o in opts if o[2]), None)
+    return (found[0], f"{found[1]}. Semester") if found else None
+
+
 def semester_form(body, page_url, today, want=""):
-    """Formular mit der Semester-Auswahl: wählt „Nur Semester“ + das passende Semester und drückt „anzeigen“.
-    Liefert (method, url, data, label, schon_eingestellt) oder None."""
-    for fm in re.finditer(r"(?is)<form\b([^>]*)>(.*?)</form>", _dec(body)):
+    """Formular mit der Semester-Auswahl (TraiNex: „Nur [1.|2.|3.|alle] Semester“ + „anzeigen“).
+    Liefert (method, url, data, label) oder None."""
+    page = _dec(body)
+    for fm in re.finditer(r"(?is)<form\b([^>]*)>(.*?)</form>", page):
         attrs, inner = fm.groups()
         target = None
         for sm in re.finditer(r"(?is)<select\b([^>]*)>(.*?)</select>", inner):
@@ -1138,17 +1172,18 @@ def semester_form(body, page_url, today, want=""):
             for o in re.finditer(r"(?is)<option\b([^>]*)>(.*?)(?=<option\b|\Z)", sm.group(2)):
                 label = _text(o.group(2))
                 v = _attr(o.group(1), "value")
-                opts.append((label if v is None else v, label, bool(re.search(r"(?i)\bselected\b", o.group(1)))))
-            if not any(re.search(r"(?i)semester", x[1]) for x in opts):
+                opts.append((label if v is None else v, label, bool(re.search(r"(?i)\bselected\b", o.group(1))),
+                             o.group(1)))
+            if not (re.search(r"(?i)sem", _attr(sm.group(1), "name") or "")
+                    or any(re.search(r"(?i)semester", x[1]) for x in opts)):
                 continue
-            pick = pick_semester([(v, lab) for v, lab, _ in opts], today, want)
+            pick = pick_semester(opts, today, want, page)
             if pick:
-                target = (_attr(sm.group(1), "name"), pick,
-                          any(sel and v == pick[0] for v, _, sel in opts))
+                target = (_attr(sm.group(1), "name"), pick)
                 break
         if not target:
             continue
-        sel_name, (sel_val, label), preset = target
+        sel_name, (sel_val, label) = target
         fields, radios, submits = [], {}, []
         for m in re.finditer(r"(?is)<(input|select|button)\b([^>]*)>", inner):
             tag, a = m.group(1).lower(), m.group(2)
@@ -1187,13 +1222,15 @@ def semester_form(body, page_url, today, want=""):
             want_r = (next((o for o in sem if re.match(r"(?i)\s*nur\b", o[1])), None)
                       or next((o for o in sem if not re.search(r"(?i)\balle\b", o[1])), None))
             if want_r:
-                preset = preset and want_r[2]
                 fields.append((name, want_r[0]))
             else:
                 cur = next((o for o in opts if o[2]), None)
                 if cur:
                     fields.append((name, cur[0]))
-        sub = next((x for x in submits if re.search(r"(?i)anzeigen", x[3] + x[1])), submits[0] if submits else None)
+        sub = (next((x for x in submits if norm(x[3] + " " + x[1]).lower() in ("anzeigen", "anzeigen anzeigen")), None)
+               or next((x for x in submits if re.search(r"(?i)anzeigen", x[3] + x[1])
+                        and not re.search(r"(?i)alle", x[3] + x[1])), None)
+               or (submits[0] if submits else None))
         if sub:
             if sub[2] == "image":
                 fields += [(sub[0] + ".x", "1"), (sub[0] + ".y", "1")]
@@ -1203,8 +1240,8 @@ def semester_form(body, page_url, today, want=""):
         action = urllib.parse.urljoin(page_url, _attr(attrs, "action") or page_url)
         data = urllib.parse.urlencode(fields)
         if method == "GET":
-            return "GET", action.split("?")[0] + "?" + data, None, label, preset
-        return "POST", action, data.encode(), label, preset
+            return "GET", action.split("?")[0] + "?" + data, None, label
+        return "POST", action, data.encode(), label
     return None
 
 
@@ -1233,25 +1270,58 @@ def find_archive(cfg, req, b):
     raise SyncError("Archiv-Seite (Lernen → Archiv) nicht gefunden. Details: sudo ./install.sh debug")
 
 
-def fetch_archive(cfg, req, today):
-    """Archiv öffnen, „Nur Semester“ + aktuelles Semester wählen, „anzeigen“. Liefert (Liste, Semester, URL).
-    Ist der Filter schon so eingestellt und die Liste da, entfällt die zusätzliche Anfrage."""
+def _page(r):
+    """(status, headers, body) → Text im angegebenen Zeichensatz (das Archiv ist ISO-8859-1)."""
+    cs = r[1].get_content_charset() if r[1] is not None else None
+    try:
+        return r[2].decode(cs) if cs else _dec(r[2])
+    except (LookupError, UnicodeDecodeError):
+        return _dec(r[2])
+
+
+def _submit(req, step, method, target, data, referer):
+    hdr = {"Referer": referer}
+    if method == "POST":
+        hdr["Content-Type"] = "application/x-www-form-urlencoded"
+    return _page(req(step, target, data, hdr))
+
+
+def fetch_archive(cfg, req, today, cache=None):
+    """Archiv öffnen, „Nur Semester“ + aktuelles Semester wählen, „anzeigen“. Ohne Filter zeigt TraiNex alle
+    Semester, „anzeigen“ ist also immer nötig. Liefert (Liste, Semester, URL, Cache).
+    Mit Cache (Formular aus dem letzten Lauf) wird direkt „anzeigen“ geschickt: 1 statt 3 Seitenabrufe.
+    Die Antwort enthält das Formular erneut; passt das Semester nicht mehr (Semesterwechsel) oder fehlt es,
+    geht es den normalen Weg."""
+    if cache:
+        try:
+            target = with_tok(urllib.parse.urljoin(cfg.base + "/", cache["url"]))
+            if cache["method"] == "GET":
+                target = target.replace("?", "?" + cache["data"] + "&", 1)
+            page = _submit(req, "D3 anzeigen (direkt)", cache["method"], target,
+                           cache["data"].encode() if cache["method"] == "POST" else None, target)
+            form = semester_form(page, target, today, cfg.docs_semester)
+            if form and form[3] == cache["label"]:
+                return parse_archive(page, target), cache["label"], target, cache
+            log("Archiv: Direktabruf passt nicht mehr – normaler Weg")
+        except SyncError as ex:
+            log("Archiv: Direktabruf fehlgeschlagen –", ex)
     url = find_archive(cfg, req, cfg.base)
-    _, _, page = req("D2 Archiv", url)
+    page = _page(req("D2 Archiv", url))
     form = semester_form(page, url, today, cfg.docs_semester)
     if not form:
         raise SyncError("Semester-Auswahl im Archiv nicht gefunden"
-                        + (f" (DOCS_SEMESTER={cfg.docs_semester})" if cfg.docs_semester else
-                           f" (kein Semester mit {today:%d.%m.%Y} im Zeitraum)") + ". Details: sudo ./install.sh debug")
-    method, target, data, label, preset = form
-    listing = parse_archive(page, url) if preset else []
-    if listing:
-        return listing, label, url
-    hdr = {"Referer": url}
-    if data is not None:
-        hdr["Content-Type"] = "application/x-www-form-urlencoded"
-    _, _, page = req("D3 anzeigen", target, data, hdr)
-    return parse_archive(page, target), label, target
+                        + (f" (DOCS_SEMESTER={cfg.docs_semester})" if cfg.docs_semester else "")
+                        + ". Fest einstellen mit DOCS_SEMESTER=3 in der .env. Details: sudo ./install.sh debug")
+    method, target, data, label = form
+    page = _submit(req, "D3 anzeigen", method, target, data, url)
+    if method == "GET":
+        p = urllib.parse.urlsplit(target)
+        cache = {"method": "GET", "url": p.path,
+                 "data": "&".join(x for x in p.query.split("&") if x and not TOKEN_PARAM.fullmatch(x))}
+    else:
+        cache = {"method": "POST", "url": canon_url(target), "data": data.decode()}
+    cache["label"] = label
+    return parse_archive(page, target), label, target, cache
 
 
 def doc_id(key):
@@ -1291,7 +1361,7 @@ def file_ext(headers, url, title):
                 fn = fn.encode("latin-1").decode("utf-8")  # rohes UTF-8 im Header
             except (UnicodeEncodeError, UnicodeDecodeError):
                 pass
-    for c in (fn, urllib.parse.unquote(urllib.parse.urlsplit(url).path), title):
+    for c in (fn, url_filename(url), title):
         if _ext(c) in DOC_EXT:
             return _ext(c), fn
     ct = (headers.get_content_type() if headers is not None else "") or ""
@@ -1783,15 +1853,16 @@ class App:
         nur neue/geänderte Dateien laden. Fehler hier lassen den Stundenplan-Sync unberührt."""
         try:
             now = dt.datetime.now(TZ)
-            listing, label, page = fetch_archive(self.cfg, req, now.date())
+            old = self.st.d.get("docs", {})
+            listing, label, page, form = fetch_archive(self.cfg, req, now.date(), old.get("form"))
             store = os.path.join(self.docs_dir(), "f")
             os.makedirs(store, exist_ok=True)
-            old = self.st.d.get("docs", {})
             for it in old.get("items", {}).values():
                 if it.get("file") and not os.path.exists(os.path.join(store, it["file"])):
                     it["present"] = False  # z. B. Webordner geleert → still neu laden
             box["result"] = sync_docs(old, listing, label, now,
                                       lambda d, item: download_doc(dl, d, store, self.cfg.docs_max, page), force)
+            box["result"][0]["form"] = form
         except Exception as ex:
             box["error"] = str(ex) if isinstance(ex, SyncError) else f"Interner Fehler: {ex!r}"
 
@@ -2322,6 +2393,7 @@ def check_docs(cfg, req, out, dump=None):
     """Probelauf Unterlagen: nur die Liste, keine Downloads. Mit dump werden die Seiten gespeichert."""
     def rec(step, url, data=None, extra=None):
         r = req(step, url, data, extra)
+        out["last"] = r
         if dump:
             os.makedirs(dump, exist_ok=True)
             fn = os.path.join(dump, re.sub(r"\W+", "_", step).strip("_") + ".html")
@@ -2330,7 +2402,7 @@ def check_docs(cfg, req, out, dump=None):
             out.setdefault("files", []).append(fn)
         return r
     try:
-        out["listing"], out["label"], _ = fetch_archive(cfg, rec, dt.date.today())
+        out["listing"], out["label"], _, _ = fetch_archive(cfg, rec, dt.date.today())
     except Exception as ex:  # Probelauf: Fehler anzeigen, Stundenplan-Check trotzdem ausgeben
         out["error"] = str(ex) if isinstance(ex, SyncError) else f"Interner Fehler: {ex!r}"
 
@@ -2341,6 +2413,14 @@ def print_docs(cfg, out):
         print(f"   gespeichert: {fn}")
     if out.get("files"):
         print("   (Die Seiten enthalten deinen Namen/Kurs – vor dem Weitergeben ggf. kürzen.)")
+    if out.get("last"):
+        page = _page(out["last"])
+        sel = re.search(r"(?is)<select\b[^>]*sem.*?</select>", page)
+        if sel:
+            print("   Semesterauswahl (HTML):", norm(page[max(0, sel.start() - 300):sel.end() + 200])[:900])
+        hits = list(re.finditer(r"(?i)datei_laden\.cfm", page)) or list(re.finditer(r"(?i)download", page))
+        for m in hits[:2]:
+            print("   Umfeld eines Dokument-Links (HTML):", norm(page[max(0, m.start() - 900):m.start() + 300]))
     if "error" in out:
         print(f"   Fehler: {out['error']}")
         return
