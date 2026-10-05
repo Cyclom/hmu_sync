@@ -1,8 +1,9 @@
 # trainex-sync – Anleitung
 
 Der Dienst holt den Studienplan regelmäßig aus TraiNex und stellt ihn als iCal-Abo unter
-`https://tillianbo.com/trainex/<geheim>.ics` bereit. Änderungen meldet er in einem Telegram-Kanal.
-Steuern kannst nur du ihn, per Telegram.
+`https://tillianbo.com/trainex/<geheim>.ics` bereit. Im selben Durchlauf gleicht er die Unterlagen aus
+**Lernen → Archiv** (aktuelles Semester) ab. Änderungen an beidem meldet er in einem Telegram-Kanal, neue
+Dokumente kommen dort direkt als Datei an. Steuern kannst nur du ihn, per Telegram.
 
 ```
 trainex_sync.py              der Dienst (nur Python-Standardbibliothek)
@@ -121,6 +122,8 @@ nach oben wischen → Koordinaten kopieren.
 | `/modules M11` | alle Termine eines Moduls, mit Buttons zum Eintragen von Fehlzeiten |
 | `/modules alle` | auch Module ohne kommende Termine |
 | `/absent M11 3 [min]` | Fehlzeit für Termin Nr. 3 eintragen: ohne Minuten der ganze Termin, `0` löscht |
+| `/docs` | Unterlagen: Semester, Anzahl, letzte Änderungen, Link zur Übersicht und Feed für den Kurzbefehl (Abschnitt 5a) |
+| `/docs newurl` | neue private Unterlagen-Links; danach die Feed-Adresse im Kurzbefehl ersetzen |
 | `/help` | Hilfe |
 
 Einstellungen bleiben bei einem Neustart erhalten. In der Ruhezeit (`QUIET_HOURS`, standardmäßig
@@ -178,11 +181,79 @@ weiterhin als Fallback, wird aber ignoriert, sobald mindestens ein Kanal über `
 ➕ neuer Termin · ❌ Termin entfällt · 📆 Termin verschoben · 🕐 Zeit geändert · 🚪 Raum geändert ·
 👤 Dozent geändert · ✏️ Titel geändert. Mehrere Änderungen am selben Termin landen in einem Eintrag.
 
+Dazu aus dem Archiv: 📄 neues Dokument und 🔁 aktualisiertes Dokument, jeweils mit der Datei als Anhang
+(auf dem iPad: Datei antippen → Teilen → GoodNotes), sowie 🗑 entfernte Dokumente als Liste.
+
 Fehler wie ein fehlgeschlagener Login oder ein nicht erreichbares TraiNex gehen **nur an dich**,
 und zwar einmal pro Fehlerserie. Sobald es wieder funktioniert, bekommst du eine Entwarnung.
 
 **Löschschutz:** Würden auf einmal mehr als 20 % der kommenden Termine (mindestens 4) wegfallen,
 ändert der Dienst nichts und fragt dich. Mit `/sync force` bestätigst du die Änderung.
+
+## 5a. Unterlagen aus dem Archiv
+
+Nach dem Stundenplan-Export öffnet der Dienst in **derselben TraiNex-Sitzung** Lernen → Archiv, wählt
+„Nur Semester“ mit dem aktuellen Semester (das, dessen Zeitraum heute enthält, z. B. *3. Semester: 01.10.2026
+bis 31.03.2027*) und klickt „anzeigen“. Das sind 2–3 zusätzliche Seitenabrufe pro Lauf. Dateien lädt er nur,
+wenn sie neu sind oder sich ihr Eintrag in der Liste geändert hat. Bei gleichem Inhalt meldet er nichts.
+
+- **Erster Lauf:** lädt alle Dokumente des Semesters, meldet aber nichts im Kanal. Du bekommst eine Nachricht
+  mit der Anzahl und dem Link zur Übersicht.
+- **Semesterwechsel:** passiert automatisch (April/Oktober). Auch hier gibt es nur eine Nachricht an dich.
+  Soll ein bestimmtes Semester fest gelten, trägst du `DOCS_SEMESTER=3` in die `.env` ein.
+- **Löschschutz:** Ist die Liste plötzlich leer oder würde mehr als die Hälfte wegfallen, ändert der Dienst
+  nichts und fragt dich. `/sync force` bestätigt.
+- **Große Dateien:** Telegram nimmt höchstens 50 MB. Größere Dateien werden nur gemeldet. Über
+  `DOCS_MAX_MB` (Standard 100) lädt der Dienst sie gar nicht.
+- Fehler beim Unterlagen-Abgleich stören den Stundenplan nicht. Du bekommst sie einmal pro Fehlerserie gemeldet.
+
+### Übersicht und Spiegel in der Dateien-App
+
+`/docs` zeigt dir zwei private Links (nicht in den Kanal posten):
+
+- **Übersicht** (`…/trainex/d/<geheim>/`): alle Dokumente nach Ordnern sortiert, zum Herunterladen.
+- **Feed** (`…/trainex/d/<geheim>/index.json`): für den Kurzbefehl, der alles nach iCloud Drive spiegelt.
+
+**Kurzbefehl einrichten (einmalig, auf dem iPad):** Lege in der Dateien-App unter iCloud Drive einen Ordner
+`TraiNex` an. Dann in der Kurzbefehle-App einen neuen Kurzbefehl „TraiNex-Unterlagen“ mit diesen Aktionen bauen:
+
+1. **Inhalte von URL abrufen**: die Feed-Adresse aus `/docs`
+2. **Datei aus Ordner abrufen**: Ordner `TraiNex`, Pfad `stand.txt`, „Fehler, wenn nicht gefunden“ **aus**
+3. **Wenn** *Datei* **hat keinen Wert** → **Text** `0` · **Sonst** → **Text** *Datei* · **Ende**.
+   Das Ergebnis mit **Variable festlegen** als `Stand` speichern.
+4. **Wörterbuchwert abrufen**: Schlüssel `files` aus *Inhalte von URL*
+5. **Wiederholen mit jedem Objekt** in *Wörterbuchwert*:
+   1. **Wenn** *Wiederholungsobjekt → Schlüssel `changed`* (Typ **Zahl**) **ist größer als** *Stand*:
+   2. **Inhalte von URL abrufen**: *Wiederholungsobjekt → Schlüssel `url`*
+   3. **Name festlegen**: *Wiederholungsobjekt → Schlüssel `name`*
+   4. **Datei sichern**: Ordner `TraiNex`, Unterpfad *Wiederholungsobjekt → Schlüssel `folder`*,
+      „Ziel erfragen“ **aus**, „Überschreiben, falls Datei existiert“ **an**
+   5. **Ende Wenn**
+6. **Ende Wiederholen**
+7. **Wörterbuchwert abrufen**: Schlüssel `updated` aus *Inhalte von URL* → **Text** mit diesem Wert →
+   **Datei sichern**: Ordner `TraiNex`, Unterpfad `stand.txt`, „Ziel erfragen“ **aus**, „Überschreiben“ **an**
+
+Danach in Kurzbefehle → **Automation** → **App** → GoodNotes → „Wird geöffnet“ → „Sofort ausführen“ den
+Kurzbefehl wählen. Jedes Mal, wenn du GoodNotes öffnest, liegen die neuen Dateien bereits in
+`TraiNex/<Modul>/`. Du importierst sie dann in GoodNotes über **+ → Importieren** oder per Drag & Drop
+aus der Dateien-App. Aktualisierte Dokumente überschreiben die alte Datei in `TraiNex`. Entfernte bleiben
+dort liegen. Deine Notizen in GoodNotes sind davon nicht betroffen, sie hängen an der importierten Kopie.
+
+Feed-Format: `{"semester", "updated", "files": [{"path", "folder", "name", "url", "size", "added", "changed"}]}`
+(Zeitangaben als Unix-Sekunden).
+
+### Wenn das Archiv nicht gefunden wird
+
+Der Dienst sucht die Archiv-Seite und den Semesterfilter selbst. Findet er sie nicht, meldet er
+„Archiv-Seite … nicht gefunden“ bzw. „Semester-Auswahl … nicht gefunden“. Dann:
+
+```bash
+sudo ./install.sh debug      # zeigt jeden Schritt; die Archiv-Seiten landen in ./trainex-debug/
+```
+
+Schick mir die Ausgabe ab „D1 Archiv“ und die Dateien aus `trainex-debug/`. Sie enthalten deinen Namen und
+Kurs, kürze sie also vorher, falls nötig. Als Notlösung kannst du den Pfad der Archiv-Seite (aus der Zeile
+„Frames:“) als `DOCS_URL=…` in die `.env` eintragen. `DOCS=0` schaltet den Abgleich ganz ab.
 
 ## 6. Wartung
 
@@ -193,7 +264,8 @@ sudo ./install.sh                       # manuelles Update (ohne GitHub): neue D
 ```
 
 - **Passwort geändert:** Neues Passwort in `/opt/trainex-sync/.env` eintragen, dann `sudo systemctl restart trainex-sync`.
-- **Daten:** `/var/lib/trainex-sync/state.json` (Termine, Einstellungen, eingetragene Fehlzeiten), `/var/www/trainex/*.ics`.
+- **Daten:** `/var/lib/trainex-sync/state.json` (Termine, Einstellungen, eingetragene Fehlzeiten, Stand der
+  Unterlagen), `/var/www/trainex/*.ics`, `/var/www/trainex/d/<geheim>/` (Unterlagen).
 - **Entfernen:** `sudo systemctl disable --now trainex-sync`, dann die Include-Zeile aus nginx entfernen und
   `/opt/trainex-sync`, `/var/lib/trainex-sync`, `/var/www/trainex`, `/etc/nginx/snippets/trainex.conf` und
   `/etc/systemd/system/trainex-sync.service` löschen.
