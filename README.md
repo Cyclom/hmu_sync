@@ -117,7 +117,7 @@ nach oben wischen → Koordinaten kopieren.
 | `/url` | Abo-URL anzeigen |
 | `/newurl` | neue geheime URL erzeugen; die alte ist sofort ungültig und alle müssen neu abonnieren |
 | `/channels` | registrierte Kanäle anzeigen |
-| `/modules` | Module mit Terminzahl, Minuten und Fehlzeit-Budget (siehe unten) |
+| `/modules` | Module mit Terminzahl, Minuten und Fehlzeit-Budget je Veranstaltungsart (siehe unten) |
 | `/modules M11` | alle Termine eines Moduls, mit Buttons zum Eintragen von Fehlzeiten |
 | `/modules alle` | auch Module ohne kommende Termine |
 | `/absent M11 3 [min]` | Fehlzeit für Termin Nr. 3 eintragen: ohne Minuten der ganze Termin, `0` löscht |
@@ -128,30 +128,40 @@ Einstellungen bleiben bei einem Neustart erhalten. In der Ruhezeit (`QUIET_HOURS
 
 ### Module und Fehlzeiten (`/modules`)
 
-`/modules` fasst alle gespeicherten Termine pro Modul zusammen. Termine können unterschiedlich lang sein,
-gezählt wird deshalb in Minuten:
+`/modules` fasst alle gespeicherten Termine pro Modul zusammen. Die Anwesenheit wird **je
+Veranstaltungsart** erfasst: Vorlesung, Seminar, Praktikum usw. eines Moduls haben jeweils ein eigenes
+Budget von 20 % ihrer Minuten. Ein verpasstes Praktikum geht also nicht vom Vorlesungs-Budget ab.
+Termine können unterschiedlich lang sein, gezählt wird deshalb in Minuten:
 
 ```
-M11 Physiologie
-→ Insgesamt 8 Termine - 5320 min
-→ Maximale Fehlzeit (20%): 1064 min
-→ 🟢 Gefehlt 90 min · geplant 180 min · übrig 794 min
-→ Kommend: 5 Termine (3325 min) · noch 3 davon verpassbar
+🟡 M11 Physiologie
+→ Insgesamt 13 Termine - 1620 min
+Vorlesung (VL): 10 Termine - 900 min
+→ Maximale Fehlzeit (20%): 180 min
+→ 🟢 Gefehlt 90 min · übrig 90 min
+→ Kommend: 6 Termine (540 min) · noch 1 davon verpassbar
+Praktikum (P): 3 Termine - 720 min
+→ Maximale Fehlzeit (20%): 144 min
+→ 🟡 Gefehlt 0 min · übrig 144 min
+→ Kommend: 2 Termine (480 min) · kein weiterer Termin verpassbar
 ```
 
 - **Gefehlt / geplant / übrig:** Fehlzeiten trägst du selbst ein. Bei begonnenen Terminen zählen sie als
-  „gefehlt“, bei kommenden als „geplant“. Beide gehen vom Budget ab.
-- **verpassbar:** So viele der kommenden Termine kannst du noch ganz auslassen, ohne die Grenze zu reißen.
-  Gerechnet wird mit den kürzesten Terminen zuerst.
-- **Ampel:** 🟢 mehr als die Hälfte des Budgets ist frei · 🟡 weniger als die Hälfte frei oder kein
-  weiterer Termin mehr verpassbar · 🔴 Grenze überschritten.
+  „gefehlt“, bei kommenden als „geplant“. Beide gehen vom Budget der jeweiligen Veranstaltungsart ab.
+- **verpassbar:** So viele der kommenden Termine dieser Art kannst du noch ganz auslassen, ohne ihre
+  Grenze zu reißen. Gerechnet wird mit den kürzesten Terminen zuerst.
+- **Ampel:** je Art 🟢 mehr als die Hälfte des Budgets ist frei · 🟡 weniger als die Hälfte frei oder kein
+  weiterer Termin mehr verpassbar · 🔴 Grenze überschritten. Vor dem Modulnamen und auf seinem Button
+  steht die schlechteste Ampel seiner Arten.
 - Tippst du auf ein Modul, siehst du alle seine Termine, nummeriert und mit Dauer, Art und Status
-  (✅ da · ❌ gefehlt · 🟠 teilweise · 💤 geplant · ▫️ kommend) sowie die Verteilung nach Art (VL, P, S …).
-  Ein Tipp auf eine Nummer markiert den ganzen Termin, ein zweiter Tipp nimmt die Markierung zurück.
+  (✅ da · ❌ gefehlt · 🟠 teilweise · 💤 geplant · ▫️ kommend) sowie das Budget jeder Art (VL, P, S …).
+  Ein Tipp auf eine Nummer markiert den ganzen Termin, ein zweiter Tipp nimmt die Markierung zurück;
+  die Rückmeldung nennt, was danach in dieser Art noch übrig ist.
   Für Teil-Fehlzeiten, z. B. 30 min zu spät, schickst du `/absent M11 3 30`.
 - Module ohne kommende Termine werden ausgeblendet, mit `/modules alle` siehst du sie trotzdem.
   Ganztägige Einträge zählen nicht mit.
-- Die Grenze stellst du mit `ABSENCE_LIMIT` in der `.env` ein (Standard `20`, in Prozent).
+- Die Grenze stellst du mit `ABSENCE_LIMIT` in der `.env` ein (Standard `20`, in Prozent je
+  Veranstaltungsart).
   Fehlzeiten bleiben gespeichert, wenn ein Termin verlegt wird. Entfällt ein Termin, wird auch seine
   Fehlzeit gelöscht.
 

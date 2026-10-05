@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 
-VERSION = "1.10"
+VERSION = "1.11"
 TZ = ZoneInfo("Europe/Berlin")
 UA = f"trainex-sync/{VERSION} (private calendar sync)"
 WD = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
@@ -499,9 +499,45 @@ def absent_min(ev, absences):
     return d if v == "all" else max(0, min(int(v), d))
 
 
+def kind_label(kind):
+    """„Vorlesung (VL)“; Termine ohne Art landen in „Ohne Art“."""
+    if not kind:
+        return "Ohne Art"
+    s = kind_short(kind)
+    return kind if s == kind else f"{kind} ({s})"
+
+
+def kind_order(kind):
+    """Bekannte Arten in der Reihenfolge von KIND_SHORT, unbekannte alphabetisch dahinter."""
+    order = list(KIND_SHORT)
+    return (order.index(kind), "") if kind in order else (len(order), kind or "~")
+
+
+def budget_stats(evs, absences, now, pct):
+    """Fehlzeit-Budget für eine Termingruppe (eine Veranstaltungsart eines Moduls)."""
+    past = [x for x in evs if to_dt(x["s"]) <= now]
+    up = [x for x in evs if to_dt(x["s"]) > now]
+    total = sum(map(duration_min, evs))
+    limit = total * pct // 100
+    missed = sum(absent_min(x, absences) for x in past)
+    planned = sum(absent_min(x, absences) for x in up)
+    rest = limit - missed - planned
+    # Wie viele weitere kommende Termine passen noch ins Budget (kürzeste zuerst)?
+    budget, skippable = max(rest, 0), 0
+    for d in sorted(duration_min(x) for x in up if not absent_min(x, absences)):
+        if d > budget:
+            break
+        budget -= d
+        skippable += 1
+    return {"events": evs, "n": len(evs), "total": total, "limit": limit, "past": len(past), "up": len(up),
+            "up_min": sum(map(duration_min, up)), "missed": missed, "planned": planned, "rest": rest,
+            "skippable": skippable}
+
+
 def module_stats(events, absences, now, pct):
-    """Fasst Termine pro Modul zusammen. Begonnene Termine gelten als stattgefunden,
-    Fehlzeiten bei kommenden Terminen als „geplant“."""
+    """Fasst Termine pro Modul zusammen. Die Anwesenheit wird je Veranstaltungsart (VL, S, P …)
+    erfasst, deshalb hat jede Art eines Moduls ihr eigenes Budget von pct % ihrer Minuten.
+    Begonnene Termine gelten als stattgefunden, Fehlzeiten bei kommenden Terminen als „geplant“."""
     groups = {}
     for ev in events:
         if duration_min(ev):
@@ -509,29 +545,19 @@ def module_stats(events, absences, now, pct):
     out = []
     for name in sorted(groups):
         evs = sorted(groups[name], key=lambda x: (x["s"], x["sum"]))
-        past = [x for x in evs if to_dt(x["s"]) <= now]
-        up = [x for x in evs if to_dt(x["s"]) > now]
-        total = sum(map(duration_min, evs))
-        limit = total * pct // 100
-        missed = sum(absent_min(x, absences) for x in past)
-        planned = sum(absent_min(x, absences) for x in up)
-        rest = limit - missed - planned
-        kinds = {}
+        by_kind = {}
         for x in evs:
-            k = kind_short(split_title(x)[1]) or "–"
-            n, mins = kinds.get(k, (0, 0))
-            kinds[k] = (n + 1, mins + duration_min(x))
-        # Wie viele weitere kommende Termine passen noch ins Budget (kürzeste zuerst)?
-        budget, skippable = max(rest, 0), 0
-        for d in sorted(duration_min(x) for x in up if not absent_min(x, absences)):
-            if d > budget:
-                break
-            budget -= d
-            skippable += 1
-        out.append({"name": name, "key": module_key(name), "events": evs, "n": len(evs), "total": total,
-                    "limit": limit, "past": len(past), "up": len(up), "up_min": sum(map(duration_min, up)),
-                    "missed": missed, "planned": planned, "rest": rest, "kinds": kinds,
-                    "skippable": skippable})
+            by_kind.setdefault(split_title(x)[1], []).append(x)
+        kinds = []
+        for kind in sorted(by_kind, key=kind_order):
+            g = budget_stats(by_kind[kind], absences, now, pct)
+            g.update(kind=kind, short=kind_short(kind) or "–", label=kind_label(kind))
+            kinds.append(g)
+        up = [x for x in evs if to_dt(x["s"]) > now]
+        out.append({"name": name, "key": module_key(name), "events": evs, "n": len(evs),
+                    "total": sum(g["total"] for g in kinds), "past": len(evs) - len(up), "up": len(up),
+                    "up_min": sum(map(duration_min, up)), "missed": sum(g["missed"] for g in kinds),
+                    "planned": sum(g["planned"] for g in kinds), "kinds": kinds})
     return out
 
 
@@ -546,26 +572,54 @@ def find_module(mods, q):
     return []
 
 
-def budget_icon(m):
-    if m["rest"] < 0:
+def kind_of(m, ev):
+    """Die Veranstaltungsart-Gruppe eines Moduls, zu der ein Termin gehört."""
+    return next(g for g in m["kinds"] if any(x["uid"] == ev["uid"] for x in g["events"]))
+
+
+ICONS = ["🟢", "🟡", "🔴"]
+
+
+def budget_icon(g):
+    """Ampel einer Art; für ein Modul die schlechteste seiner Arten."""
+    if "kinds" in g:
+        return max((budget_icon(k) for k in g["kinds"]), key=ICONS.index, default="🟢")
+    if g["rest"] < 0:
         return "🔴"
-    if m["rest"] * 2 < m["limit"] or (m["up"] and not m["skippable"]):
+    if g["rest"] * 2 < g["limit"] or (g["up"] and not g["skippable"]):
         return "🟡"
     return "🟢"
 
 
-def budget_line(m):
-    parts = [f"Gefehlt {m['missed']} min"]
-    if m["planned"]:
-        parts.append(f"geplant {m['planned']} min")
-    parts.append(f"übrig {m['rest']} min" if m["rest"] >= 0 else f"<b>überschritten um {-m['rest']} min</b>")
-    return f"{budget_icon(m)} " + " · ".join(parts)
+def rest_text(g):
+    return f"übrig {g['rest']} min" if g["rest"] >= 0 else f"überschritten um {-g['rest']} min"
 
 
-def skippable_text(m):
-    if not m["skippable"]:
+def budget_line(g):
+    parts = [f"Gefehlt {g['missed']} min"]
+    if g["planned"]:
+        parts.append(f"geplant {g['planned']} min")
+    parts.append(rest_text(g) if g["rest"] >= 0 else f"<b>{rest_text(g)}</b>")
+    return f"{budget_icon(g)} " + " · ".join(parts)
+
+
+def skippable_text(g):
+    if not g["skippable"]:
         return "<b>kein weiterer Termin verpassbar</b>"
-    return f"noch {m['skippable']} davon verpassbar"
+    return f"noch {g['skippable']} davon verpassbar"
+
+
+def n_termine(n):
+    return f"{n} Termin" if n == 1 else f"{n} Termine"
+
+
+def kind_block(g, pct):
+    """Budget einer Veranstaltungsart, z. B. Vorlesung oder Seminar."""
+    up = (f"→ Kommend: {n_termine(g['up'])} ({g['up_min']} min) · {skippable_text(g)}" if g["up"]
+          else "→ Abgeschlossen")
+    return [f"<u>{e(g['label'])}</u>: {n_termine(g['n'])} - {g['total']} min",
+            f"→ Maximale Fehlzeit ({pct}%): {g['limit']} min",
+            f"→ {budget_line(g)}", up]
 
 
 def event_icon(ev, absences, now):
@@ -585,16 +639,12 @@ def format_modules(mods, pct, show_all=False):
     if not mods:
         return "Noch keine Termine gespeichert – erst /sync."
     shown = [m for m in mods if m["up"] or show_all]
-    L = [f"📚 <b>Module & Fehlzeiten</b> (Grenze {pct} %)"]
+    L = [f"📚 <b>Module & Fehlzeiten</b>\nGrenze {pct} % je Veranstaltungsart (Vorlesung, Seminar, Praktikum …)"]
     for m in shown:
-        if m["up"]:
-            up = f"→ Kommend: {m['up']} Termine ({m['up_min']} min) · {skippable_text(m)}"
-        else:
-            up = "→ Abgeschlossen"
-        L.append("\n".join([f"<b>{e(m['name'])}</b>",
-                            f"→ Insgesamt {m['n']} Termine - {m['total']} min",
-                            f"→ Maximale Fehlzeit ({pct}%): {m['limit']} min",
-                            f"→ {budget_line(m)}", up]))
+        block = [f"{budget_icon(m)} <b>{e(m['name'])}</b>", f"→ Insgesamt {n_termine(m['n'])} - {m['total']} min"]
+        for g in m["kinds"]:
+            block += kind_block(g, pct)
+        L.append("\n".join(block))
     hidden = len(mods) - len(shown)
     if hidden:
         L.append(f"<i>{hidden} abgeschlossene(s) Modul(e) ausgeblendet – /modules alle</i>")
@@ -629,14 +679,13 @@ def event_line(i, ev, m, absences, now):
 def format_module(m, pct, absences, now, note="", max_len=3800):
     head = ([note, ""] if note else []) + [
         f"📘 <b>{e(m['name'])}</b>",
-        f"→ Insgesamt {m['n']} Termine - {m['total']} min ({fmt_hours(m['total'])})",
-        f"→ Maximale Fehlzeit ({pct}%): {m['limit']} min",
-        f"→ {budget_line(m)}",
-        "→ Nach Art: " + " · ".join(f"{k} {n}× ({mins} min)" for k, (n, mins) in sorted(m["kinds"].items())),
+        f"→ Insgesamt {n_termine(m['n'])} - {m['total']} min ({fmt_hours(m['total'])})",
+        f"→ Grenze {pct} % je Veranstaltungsart",
     ]
-    if m["up"]:
-        head.append(f"→ Kommend: {m['up']} Termine · {skippable_text(m)}"
-                    + (" (kürzeste zuerst)" if m["skippable"] else ""))
+    for g in m["kinds"]:
+        head += [""] + kind_block(g, pct)
+    if any(g["skippable"] for g in m["kinds"]):
+        head.append("<i>verpassbar: kürzeste Termine zuerst, je Art gerechnet</i>")
     lines = [event_line(i, ev, m, absences, now) for i, ev in enumerate(m["events"], 1)]
     foot = ["", "✅ da · ❌ gefehlt · 🟠 teilweise · 💤 geplant · ▫️ kommend",
             "Nummer antippen = ganzer Termin gefehlt/geplant (nochmal = zurück). "
@@ -1193,17 +1242,20 @@ class App:
             self.notify_admin(f"{e(m['name'])} hat die Termine 1–{m['n']}.")
             return
         ev, ab = m["events"][nr - 1], self.st.d["absences"]
+        what = f"Nr. {nr} ({kind_of(m, ev)['short']})"
         if mins == 0:
             ab.pop(ev["uid"], None)
-            note = f"🗑 Nr. {nr}: Fehlzeit gelöscht."
+            note = f"🗑 {what}: Fehlzeit gelöscht."
         elif mins is None or mins >= duration_min(ev):
             ab[ev["uid"]] = "all"
-            note = f"✏️ Nr. {nr}: ganzer Termin ({duration_min(ev)} min) eingetragen."
+            note = f"✏️ {what}: ganzer Termin ({duration_min(ev)} min) eingetragen."
         else:
             ab[ev["uid"]] = mins
-            note = f"✏️ Nr. {nr}: {mins} min eingetragen."
+            note = f"✏️ {what}: {mins} min eingetragen."
         self.st.save()
         m, _ = self.pick_module(m["name"])
+        g = kind_of(m, ev)
+        note += f"\n{budget_icon(g)} {e(g['label'])}: {rest_text(g)}"
         self.tg.send(self.cfg.admin, *self.module_view(m, note))
 
     def handle_callback(self, cq):
@@ -1233,6 +1285,8 @@ class App:
                                  else "Fehlen geplant")
                     self.st.save()
                     m = next(x for x in self.modules() if x["key"] == key)
+                    g = kind_of(m, ev)
+                    toast += f" · {g['label']}: {rest_text(g)}"
             text, kb = self.module_view(m)
         self.tg.edit((msg.get("chat") or {}).get("id", self.cfg.admin), msg.get("message_id"), text, kb)
         self.tg.call("answerCallbackQuery", callback_query_id=cq["id"], text=toast)
@@ -1247,7 +1301,7 @@ class App:
             "/url – Abo-URL anzeigen\n"
             "/newurl – neue geheime Abo-URL erzeugen (alte wird ungültig)\n"
             "/channels – registrierte Kanäle anzeigen\n"
-            "/modules – Module mit Terminen, Minuten und Fehlzeit-Budget\n"
+            "/modules – Module mit Terminen, Minuten und Fehlzeit-Budget je Veranstaltungsart\n"
             "/modules &lt;Modul&gt; – alle Termine eines Moduls (z. B. /modules M11)\n"
             "/modules alle – auch abgeschlossene Module\n"
             "/absent &lt;Modul&gt; &lt;Nr&gt; [min] – Fehlzeit eintragen (0 = löschen)\n"

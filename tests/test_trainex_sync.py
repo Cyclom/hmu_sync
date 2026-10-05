@@ -273,7 +273,7 @@ class Channels(unittest.TestCase):
 
 
 class Modules(unittest.TestCase):
-    """/modules: Termine, Minuten und Fehlzeit-Budget pro Modul."""
+    """/modules: Termine, Minuten und Fehlzeit-Budget pro Modul und Veranstaltungsart."""
 
     def setUp(self):
         raw = base_events()
@@ -289,29 +289,59 @@ class Modules(unittest.TestCase):
         mods = T.module_stats(self.events, absences or {}, self.now, pct)
         return {m["name"]: m for m in mods}
 
+    def kinds(self, absences=None, pct=20):
+        return {g["short"]: g for g in self.mod(absences, pct)["M11 Physiologie"]["kinds"]}
+
     def test_totals_and_limit(self):
         m = self.mod()["M11 Physiologie"]
         self.assertEqual((m["n"], m["total"]), (6, 5 * 90 + 240))   # ganztägiger Eintrag zählt nicht
-        self.assertEqual(m["limit"], 138)                          # 20 % von 690
         self.assertEqual((m["past"], m["up"], m["up_min"]), (3, 3, 420))
-        self.assertEqual(m["kinds"], {"VL": (5, 450), "P": (1, 240)})
         self.assertIn("M12 Biochemie/Molekularbiologie", self.mod())
+
+    def test_limit_per_kind(self):
+        """Jede Veranstaltungsart hat ihr eigenes Budget, nicht das Modul als Ganzes."""
+        vl, p = self.kinds()["VL"], self.kinds()["P"]
+        self.assertEqual([g["short"] for g in self.mod()["M11 Physiologie"]["kinds"]], ["VL", "P"])
+        self.assertEqual((vl["label"], vl["n"], vl["total"], vl["limit"]), ("Vorlesung (VL)", 5, 450, 90))
+        self.assertEqual((p["label"], p["n"], p["total"], p["limit"]), ("Praktikum (P)", 1, 240, 48))
+        self.assertEqual((vl["past"], vl["up"], vl["up_min"]), (3, 2, 180))
+        self.assertEqual((p["past"], p["up"], p["up_min"]), (0, 1, 240))
+        # Das Praktikum (240 min) passt nie in sein Budget von 48 min, Vorlesungen dürfen einmal fehlen
+        self.assertEqual((vl["skippable"], p["skippable"]), (1, 0))
+        self.assertEqual((T.budget_icon(vl), T.budget_icon(p)), ("🟢", "🟡"))
+        self.assertEqual(T.budget_icon(self.mod()["M11 Physiologie"]), "🟡")   # schlechteste Art zählt
 
     def test_absences_full_partial_planned(self):
         ab = {self.m11[0]["uid"]: "all", self.m11[1]["uid"]: 30, self.m11[4]["uid"]: "all",
               self.m11[2]["uid"]: 500}                              # mehr als Termindauer -> gedeckelt
         m = self.mod(ab)["M11 Physiologie"]
-        self.assertEqual(m["missed"], 90 + 30 + 90)
-        self.assertEqual(m["planned"], 90)
-        self.assertEqual(m["rest"], 138 - 300)
-        self.assertEqual(m["skippable"], 0)
+        vl, p = self.kinds(ab)["VL"], self.kinds(ab)["P"]
+        self.assertEqual((m["missed"], m["planned"]), (90 + 30 + 90, 90))
+        self.assertEqual((vl["missed"], vl["planned"], vl["rest"]), (210, 90, 90 - 300))
+        self.assertEqual((p["missed"], p["planned"], p["rest"]), (0, 0, 48))  # andere Art unberührt
+        self.assertEqual(vl["skippable"], 0)
+        self.assertEqual(T.budget_icon(vl), "🔴")
         self.assertEqual(T.budget_icon(m), "🔴")
-        self.assertIn("überschritten um 162 min", T.budget_line(m))
+        self.assertIn("überschritten um 210 min", T.budget_line(vl))
+
+    def test_absence_counts_only_for_its_kind(self):
+        """Ein verpasstes Praktikum zieht nicht vom Vorlesungs-Budget ab."""
+        prak = next(x for x in self.m11 if "Praktikum" in x["sum"])
+        k = self.kinds({prak["uid"]: "all"})
+        self.assertEqual((k["P"]["planned"], k["P"]["rest"]), (240, 48 - 240))
+        self.assertEqual((k["VL"]["planned"], k["VL"]["rest"]), (0, 90))
+        self.assertEqual((T.budget_icon(k["P"]), T.budget_icon(k["VL"])), ("🔴", "🟢"))
 
     def test_skippable_shortest_first(self):
-        m = self.mod(pct=50)["M11 Physiologie"]                  # Budget 345 min
-        self.assertEqual(m["skippable"], 2)                        # 90 + 90, nicht das 240-min-Praktikum
-        self.assertEqual(self.mod(pct=0)["M11 Physiologie"]["skippable"], 0)
+        k = self.kinds(pct=50)                                    # VL-Budget 225 min, P 120 min
+        self.assertEqual(k["VL"]["skippable"], 2)                  # 90 + 90
+        self.assertEqual(k["P"]["skippable"], 0)                   # 240-min-Praktikum passt nicht
+        self.assertEqual(self.kinds(pct=0)["VL"]["skippable"], 0)
+
+    def test_unknown_and_missing_kind(self):
+        self.assertEqual(T.kind_label("Tutorium"), "Tutorium (T)")
+        self.assertEqual(T.kind_label(""), "Ohne Art")
+        self.assertLess(T.kind_order("Seminar"), T.kind_order("Tutorium"))
 
     def test_find_module(self):
         mods = T.module_stats(self.events, {}, self.now, 20)
@@ -322,8 +352,16 @@ class Modules(unittest.TestCase):
 
     def test_overview_format(self):
         text = T.format_modules(list(self.mod().values()), 20)
-        self.assertIn("<b>M11 Physiologie</b>\n→ Insgesamt 6 Termine - 690 min\n"
-                      "→ Maximale Fehlzeit (20%): 138 min", text)
+        self.assertIn("Grenze 20 % je Veranstaltungsart", text)
+        self.assertIn("🟡 <b>M11 Physiologie</b>\n→ Insgesamt 6 Termine - 690 min\n"
+                      "<u>Vorlesung (VL)</u>: 5 Termine - 450 min\n"
+                      "→ Maximale Fehlzeit (20%): 90 min\n"
+                      "→ 🟢 Gefehlt 0 min · übrig 90 min\n"
+                      "→ Kommend: 2 Termine (180 min) · noch 1 davon verpassbar\n"
+                      "<u>Praktikum (P)</u>: 1 Termin - 240 min\n"
+                      "→ Maximale Fehlzeit (20%): 48 min\n"
+                      "→ 🟡 Gefehlt 0 min · übrig 48 min\n"
+                      "→ Kommend: 1 Termin (240 min) · <b>kein weiterer Termin verpassbar</b>", text)
         later = dt.datetime(2031, 1, 1, tzinfo=T.TZ)
         mods = T.module_stats(self.events, {}, later, 20)
         self.assertIn("4 abgeschlossene(s) Modul(e) ausgeblendet", T.format_modules(mods, 20))
@@ -334,6 +372,9 @@ class Modules(unittest.TestCase):
         m = self.mod(ab)["M11 Physiologie"]
         text, first = T.format_module(m, 20, ab, self.now)
         self.assertEqual(first, 0)
+        self.assertIn("<u>Vorlesung (VL)</u>: 5 Termine - 450 min\n→ Maximale Fehlzeit (20%): 90 min\n"
+                      "→ 🔴 Gefehlt 120 min · geplant 90 min · <b>überschritten um 120 min</b>", text)
+        self.assertIn("<u>Praktikum (P)</u>: 1 Termin - 240 min\n→ Maximale Fehlzeit (20%): 48 min", text)
         self.assertIn("❌ Mo 07.10. 09:45–11:15 · 90 min · VL - Thema 0 · <b>gefehlt</b>", text)
         self.assertIn("🟠 Fr 11.10.", text)
         self.assertIn("−30 min", text)
@@ -371,8 +412,9 @@ class ModuleCommands(unittest.TestCase):
     def test_modules_overview(self):
         self.app.handle("/modules")
         text, kb = self.last()
-        self.assertIn("→ Insgesamt 5 Termine - 450 min", text)
-        self.assertIn("→ Maximale Fehlzeit (20%): 90 min", text)
+        self.assertIn("→ Insgesamt 5 Termine - 450 min\n<u>Vorlesung (VL)</u>: 5 Termine - 450 min\n"
+                      "→ Maximale Fehlzeit (20%): 90 min", text)
+        self.assertIn("<u>Seminar mit klin. Bezug (KS)</u>", text)
         self.assertEqual(len(kb["inline_keyboard"]), 4)
 
     def test_modules_detail_and_unknown(self):
@@ -389,6 +431,7 @@ class ModuleCommands(unittest.TestCase):
         uid2 = [x for x in self.app.st.d["events"] if x["sum"].startswith("M11")][1]["uid"]
         self.assertEqual(ab, {uid2: 30})
         self.assertIn("−30 min geplant", self.last()[0])
+        self.assertIn("✏️ Nr. 2 (VL): 30 min eingetragen.\n🟡 Vorlesung (VL): übrig 60 min", self.last()[0])
         self.app.handle("/absent M11 2")
         self.assertEqual(ab, {uid2: "all"})
         self.app.handle("/absent M11 2 0")
@@ -410,7 +453,7 @@ class ModuleCommands(unittest.TestCase):
         toggle = kb["inline_keyboard"][0][0]["callback_data"]
         self.app.handle_callback({"id": "q2", "data": toggle, "message": {"chat": {"id": 111}, "message_id": 5}})
         self.assertEqual(list(self.app.st.d["absences"].values()), ["all"])
-        self.assertEqual(self.app.tg.calls[-1][1]["text"], "Fehlen geplant")
+        self.assertEqual(self.app.tg.calls[-1][1]["text"], "Fehlen geplant · Vorlesung (VL): übrig 0 min")
         self.assertEqual(self.last()[1]["inline_keyboard"][0][0]["text"], "💤1")
         self.app.handle_callback({"id": "q3", "data": toggle, "message": {"chat": {"id": 111}, "message_id": 5}})
         self.assertEqual(self.app.st.d["absences"], {})
