@@ -205,6 +205,9 @@ wenn sie neu sind oder sich ihr Eintrag in der Liste geändert hat. Bei gleichem
   nichts und fragt dich. `/sync force` bestätigt.
 - **Große Dateien:** Telegram nimmt höchstens 50 MB. Größere Dateien werden nur gemeldet. Über
   `DOCS_MAX_MB` (Standard 100) lädt der Dienst sie gar nicht.
+- **Ordner:** Die Abschnitte im Archiv werden dem Modul aus dem Stundenplan zugeordnet. „M12 Biochemie (2/3) -
+  Vorlesung WiSe26“ landet also unter *M12 Biochemie/Molekularbiologie*. Abschnitte ohne Modulnummer behalten
+  ihren Namen aus dem Archiv. Die Trennstriche, die TraiNex in lange Namen einfügt („Feinplan- ung“), entfernt der Dienst.
 - Fehler beim Unterlagen-Abgleich stören den Stundenplan nicht. Du bekommst sie einmal pro Fehlerserie gemeldet.
 
 ### Übersicht und Spiegel in der Dateien-App

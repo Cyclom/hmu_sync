@@ -145,6 +145,39 @@ class Form(unittest.TestCase):
         self.assertEqual(T.url_filename(d["url"]), "Einfuehrung_M07.pdf")
 
 
+class RealNames(unittest.TestCase):
+    """Formen aus dem echten Archiv (Probelauf 05.10.2026)."""
+    def test_unwrap(self):
+        self.assertEqual(T.unwrap("I0_M12_Biochemie_Feinplan- ung_3FS_WiSe26"), "I0_M12_Biochemie_Feinplanung_3FS_WiSe26")
+        self.assertEqual(T.unwrap("V02_M12_06_II_Energiestof- fwechsel_WiSe26"), "V02_M12_06_II_Energiestoffwechsel_WiSe26")
+        self.assertEqual(T.unwrap("HMUDK_KursprogrammWiSe26/- 27"), "HMUDK_KursprogrammWiSe26/27")
+        self.assertEqual(T.unwrap("Teil- und Ganzkörper"), "Teil- und Ganzkörper")
+        self.assertEqual(T.unwrap("Feinplanung_Physiologie_HMU_Düsseldorf_3_FS WiSe2026-2027"),
+                         "Feinplanung_Physiologie_HMU_Düsseldorf_3_FS WiSe2026-2027")
+
+    def test_section_and_module(self):
+        self.assertEqual(T.clean_section("[ auf klappen ] M11 Physiologie Materialien WiSe2025-2026"),
+                         "M11 Physiologie Materialien WiSe2025-2026")
+        mods = T.module_codes(T.parse_ics(to_ics(base_events())))
+        self.assertEqual(mods["M12"], "M12 Biochemie/Molekularbiologie")
+        self.assertEqual(T.module_folder("M12 Biochemie (2/3) - Vorlesung WiSe26", mods),
+                         "M12 Biochemie/Molekularbiologie")
+        self.assertEqual(T.module_folder("M99 Neu - WS 2026/2027", mods), "M99 Neu - WS 2026/2027")
+        self.assertEqual(T.module_folder("Allgemein", mods), "Allgemein")
+        self.assertEqual(T.doc_paths({"a": dict(id="a", title="x", name="x.pdf", folder="M12 …",
+                                                module="M12 Biochemie/Molekularbiologie")}),
+                         {"a": "M12 Biochemie-Molekularbiologie/x.pdf"})
+
+    def test_meta_and_caption(self):
+        info = "3. Sem. ( 02.10.2026 ) Prof. Dr. Kötter, S. PDF (3.30 MB)"
+        self.assertEqual(T.doc_meta(info), "02.10.2026 · Prof. Dr. Kötter, S. · 3.30 MB")
+        self.assertEqual(T.doc_meta("irgendwas"), "")
+        it = dict(title="V1", name="V1_M11.11 Niere 1.pdf", folder="M11 Physiologie Materialien",
+                  module="M11 Physiologie", info=info, size=10)
+        self.assertEqual(T.format_doc_caption("new", it), "📄 <b>Neues Dokument</b> · M11 Physiologie\n"
+                         "V1_M11.11 Niere 1.pdf\n02.10.2026 · Prof. Dr. Kötter, S. · 3.30 MB")
+
+
 class ArchiveCache(unittest.TestCase):
     def test_stale_cache_falls_back(self):
         os.environ["TRAINEX_BASE"] = "https://x.de/hmu24"

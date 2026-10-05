@@ -1070,10 +1070,45 @@ def url_filename(url):
     return ""
 
 
+def unwrap(title):
+    """TraiNex bricht lange Namen alle ~25 Zeichen mit „-“ + Umbruch: „…Feinplan- ung“ → „…Feinplanung“.
+    Nur nach langen Wortketten, echte Bindestriche wie „Teil- und …“ bleiben."""
+    return re.sub(r"(\S{20,}?)- (?=\S)", r"\1", title)
+
+
+def clean_section(text):
+    """Abschnittsüberschrift im Archiv ohne Bedienelemente wie „[ auf klappen ]“."""
+    return norm(re.sub(r"\[[^\]]{0,25}\]", " ", text)) or text
+
+
+def module_codes(events):
+    """{"M12": "M12 Biochemie/Molekularbiologie", …} aus den Stundenplan-Terminen."""
+    out = {}
+    for ev in events:
+        m = re.match(r"(M\d{1,2})\b", module_name(ev))
+        if m:
+            out.setdefault(m.group(1).upper(), module_name(ev))
+    return out
+
+
+def module_folder(section, modules):
+    """Ordner für Telegram/Dateien-App: der Modulname aus dem Stundenplan („M12 Biochemie (2/3) - Vorlesung
+    WiSe26“ → „M12 Biochemie/Molekularbiologie“), sonst die Überschrift aus dem Archiv."""
+    m = re.match(r"\s*(M\d{1,2})\b", section or "")
+    return modules.get(m.group(1).upper(), section) if m else (section or "Allgemein")
+
+
+def doc_meta(info):
+    """„3. Sem. ( 02.10.2026 ) Prof. Dr. Kötter, S. PDF (3.30 MB)“ → „02.10.2026 · Prof. Dr. Kötter, S. · 3.30 MB“."""
+    m = re.search(r"\(\s*(\d{2}\.\d{2}\.\d{4})\s*\)\s*(.*?)\s*(?:\b[A-Z]{2,5}\s*)?\(\s*([\d.,]+\s*[KMG]B)\s*\)",
+                  info or "")
+    return " · ".join(x for x in m.groups() if x) if m else ""
+
+
 def doc_title(link_text, title_attr, row_text, url):
     for c in (link_text, title_attr):
         if not _generic(c):
-            return c[:150]
+            return unwrap(c)[:150]
     m = re.search(r"[^\s/\\<>|]+\.(?:%s)\b" % "|".join(sorted(DOC_EXT)), row_text, re.I)
     if m:
         return m.group(0)
@@ -1101,7 +1136,7 @@ def parse_archive(body, page_url):
         if not links:
             if 0 < len(rtext) <= 150 and not re.search(r"(?i)<th\b|<input|<select|<form", row) \
                     and not _is_header(rtext):
-                folder = rtext
+                folder = clean_section(rtext)
             continue
         for full, ltxt, ttl in links:
             key = canon_url(full)
@@ -1417,7 +1452,7 @@ def sync_docs(old, listing, label, now, grab=None, force=False):
     for k, d in pairs:
         o = items[k]
         changed = d["key"] != o["key"] or d["info"] != o["info"] or not o.get("present", True)
-        o.update(title=d["title"], folder=d["folder"])
+        o.update(title=d["title"], folder=d["folder"], module=d.get("module") or d["folder"])
         if not changed:
             continue
         got = fetch(d, o)
@@ -1437,6 +1472,7 @@ def sync_docs(old, listing, label, now, grab=None, force=False):
                 entries.append(("upd", o))
     for d in new:
         item = {"id": doc_id(d["key"]), "key": d["key"], "title": d["title"], "folder": d["folder"],
+                "module": d.get("module") or d["folder"],
                 "info": d["info"], "added": ts, "changed": ts, "present": True}
         got = fetch(d, item)
         if got is False:
@@ -1462,11 +1498,15 @@ def sync_docs(old, listing, label, now, grab=None, force=False):
                             "listed": len(listing), "removed": gone}
 
 
+def doc_group(it):
+    return it.get("module") or it.get("folder") or "Allgemein"
+
+
 def doc_paths(items):
     """Pfad je Dokument für den Spiegel in der Dateien-App: „Ordner/Name“, doppelte Namen mit (2), (3) …"""
     out, used = {}, set()
     for it in sorted(items.values(), key=lambda x: (x.get("added", 0), x["id"])):
-        folder = safe_name(it["folder"] or "Allgemein", 80)
+        folder = safe_name(doc_group(it), 80)
         name = it.get("name") or safe_name(it["title"])
         stem, dot, ext = name.rpartition(".") if "." in name else (name, "", "")
         p, n = f"{folder}/{name}", 2
@@ -1547,8 +1587,10 @@ def build_docs_page(docs, updated):
 
 def format_doc_caption(typ, it):
     head = {"new": "📄 <b>Neues Dokument</b>", "upd": "🔁 <b>Dokument aktualisiert</b>"}[typ]
-    folder = f" · {e(it['folder'])}" if it.get("folder") else ""
-    text = f"{head}{folder}\n{e(it.get('name') or it['title'])}"
+    text = f"{head} · {e(doc_group(it))}\n{e(it.get('name') or it['title'])}"
+    meta = doc_meta(it.get("info"))
+    if meta:
+        text += f"\n{e(meta)}"
     big = it.get("big") or (it.get("size", 0) > TG_MAX_FILE and it["size"])
     if big:
         text += f"\n⚠️ Zu groß für Telegram ({fmt_size(big)}) – bitte im TraiNex herunterladen."
@@ -1590,7 +1632,7 @@ def download_doc(dl, d, store, max_bytes, referer=None):
 
 def format_doc_removed(items):
     lines = [f"🗑 <b>Dokument{'e' if len(items) > 1 else ''} entfernt</b>"]
-    lines += [f"• {e(it.get('name') or it['title'])}" + (f" ({e(it['folder'])})" if it.get("folder") else "")
+    lines += [f"• {e(it.get('name') or it['title'])}" + f" ({e(doc_group(it))})"
               for it in items]
     return "\n".join(lines)
 
@@ -1855,6 +1897,9 @@ class App:
             now = dt.datetime.now(TZ)
             old = self.st.d.get("docs", {})
             listing, label, page, form = fetch_archive(self.cfg, req, now.date(), old.get("form"))
+            modules = module_codes(self.st.d["events"])
+            for d in listing:
+                d["module"] = module_folder(d["folder"], modules)
             store = os.path.join(self.docs_dir(), "f")
             os.makedirs(store, exist_ok=True)
             for it in old.get("items", {}).values():
@@ -1887,7 +1932,7 @@ class App:
         d["docs"] = state
         if entries:
             d["docs_last"] = {"time": state["checked"],
-                              "items": [[t, it.get("name") or it["title"], it.get("folder", "")]
+                              "items": [[t, it.get("name") or it["title"], doc_group(it)]
                                         for t, it in entries][:15]}
         self.st.save()
         self.publish_docs()
@@ -1960,7 +2005,7 @@ class App:
                     + (f"\n⚠️ {e(d['docs_error'])}" if d.get("docs_error") else "\nDer nächste Sync holt sie (/sync)."))
         items = docs["items"].values()
         L = [f"📚 <b>Unterlagen</b> · {e(docs['semester'])}",
-             f"{len(docs['items'])} Dokumente in {len({x['folder'] for x in items})} Ordnern · "
+             f"{len(docs['items'])} Dokumente in {len({doc_group(x) for x in items})} Ordnern · "
              f"geprüft {ft(docs['checked'])}"]
         if d.get("docs_error"):
             L.append(f"⚠️ Letzter Abgleich fehlgeschlagen: {e(d['docs_error'])}")
@@ -2425,9 +2470,10 @@ def print_docs(cfg, out):
         print(f"   Fehler: {out['error']}")
         return
     listing = out["listing"]
+    modules = module_codes(State(cfg).d["events"])
     print(f"   Semester: {out['label']}\n   {len(listing)} Dokumente in der Liste")
     for d in listing[:60]:
-        print(f"   • [{d['folder'] or '–'}] {d['title']}  ·  {d['info'][:60]}  ·  {d['key'][:80]}")
+        print(f"   • [{module_folder(d['folder'], modules)}] {d['title']}  ·  {doc_meta(d['info']) or d['info'][:60]}")
     if len(listing) > 60:
         print(f"   … und {len(listing) - 60} weitere")
     old = State(cfg).d.get("docs", {})
