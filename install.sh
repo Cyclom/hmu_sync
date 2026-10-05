@@ -2,7 +2,7 @@
 # trainex-sync – Installation & Hilfsbefehle (als root ausführen)
 #   sudo ./install.sh            installieren / aktualisieren
 #   sudo ./install.sh check      Testabruf von TraiNex (schreibt nichts)
-#   sudo ./install.sh debug      Testabruf mit Details zu jedem Schritt
+#   sudo ./install.sh debug      Testabruf mit Details zu jedem Schritt (Archiv-Seiten → ./trainex-debug/)
 #   sudo ./install.sh discover   Telegram-Chat-IDs anzeigen
 #   sudo ./install.sh testmsg    Testnachricht an dich + Kanal
 #   sudo ./install.sh start      Dienst aktivieren und starten
@@ -65,7 +65,7 @@ EOF
     fi
     ;;
 check)    run_py check ;;
-debug)    run_py check --debug ;;
+debug)    run_py check --debug --dump "$SRC/trainex-debug" ;;
 discover) run_py discover ;;
 testmsg)  run_py testmsg ;;
 start)

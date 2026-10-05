@@ -5,6 +5,7 @@
 
 # Laufzeitdaten
 state.json
+trainex-debug/
 *.ics
 !tests/**/*.ics
 

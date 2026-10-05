@@ -6,11 +6,13 @@ Nur Python-Standardbibliothek (>= 3.9).
 Befehle:
   trainex_sync.py [--env DATEI] run                Dienst (Telegram-Bot + Zeitplan)
   trainex_sync.py [--env DATEI] check [--file X]   Testabruf, zeigt Änderungen, schreibt nichts
+                                [--debug] [--dump DIR]   … mit Details zu jedem Schritt, Seiten nach DIR speichern
   trainex_sync.py [--env DATEI] discover           Telegram-Chat-IDs anzeigen
   trainex_sync.py [--env DATEI] testmsg            Testnachricht an Admin + Kanal
 """
 import datetime as dt
 import hashlib
+import mimetypes
 import html
 import http.cookiejar
 import json
@@ -18,13 +20,14 @@ import os
 import re
 import secrets
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 
-VERSION = "1.11"
+VERSION = "1.12"
 TZ = ZoneInfo("Europe/Berlin")
 UA = f"trainex-sync/{VERSION} (private calendar sync)"
 WD = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
@@ -78,6 +81,11 @@ class Cfg:
         self.absence_limit = int(a) if a.isdigit() and 0 <= int(a) <= 100 else 20
         g = e("CAMPUS_GEO", "").replace(" ", "")
         self.campus_geo = [float(x) for x in g.split(",")] if re.fullmatch(r"-?\d+\.\d+,-?\d+\.\d+", g) else None
+        self.docs = e("DOCS", "1").strip().lower() not in ("0", "nein", "no", "off", "false")
+        self.docs_semester = e("DOCS_SEMESTER", "").strip().rstrip(".")
+        self.docs_url = e("DOCS_URL", "").strip()
+        m = e("DOCS_MAX_MB", "100").strip()
+        self.docs_max = (int(m) if m.isdigit() and int(m) > 0 else 100) * 1024 * 1024
         q = e("QUIET_HOURS", "").strip()  # z. B. "22-6"
         self.quiet = tuple(int(x) for x in q.split("-")) if re.fullmatch(r"\d{1,2}-\d{1,2}", q) else None
 
@@ -154,7 +162,15 @@ def fetch_export(cfg, req, b):
     return best or b"TraiNex: keine Listenansicht im Stundenplan gefunden"
 
 
-def fetch_trainex(cfg, debug=False):
+class TooBig(SyncError):
+    def __init__(self, size):
+        super().__init__(f"Datei zu groß ({size / 1048576:.0f} MB)")
+        self.size = size
+
+
+def fetch_trainex(cfg, debug=False, extra=None):
+    """Login, Stundenplan-Export, Logout. extra(req, dl) läuft in derselben Sitzung nach dem Export
+    (Unterlagen), damit pro Zyklus nur ein Login nötig ist."""
     jar = http.cookiejar.CookieJar()
     op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
     op.addheaders = [("User-Agent", UA), ("Accept-Language", "de-DE,de;q=0.9")]
@@ -195,10 +211,14 @@ def fetch_trainex(cfg, debug=False):
         links = sorted({urllib.parse.urlsplit(html.unescape(m)).path.rsplit('/', 1)[-1] + '?' +
                         '&'.join(q for q in urllib.parse.urlsplit(html.unescape(m)).query.split('&')
                                  if q and not re.match(r"(TokCF19|IDphp17|sec18m|\d+$)", q))
-                        for m in re.findall(r"[\"']([^\"'<>\s]*einsatzplan_\w+\.cfm[^\"'<>\s]*)[\"']",
+                        for m in re.findall(r"[\"']([^\"'<>\s]*(?:einsatzplan_\w+|\w*(?:archiv|download|datei|"
+                                            r"dokument|layout)\w*)\.cfm[^\"'<>\s]*)[\"']",
                                             body.decode("utf-8", "replace"), re.I)})
         if links:
-            print(f"   Links: {' , '.join(links[:15])}")
+            print(f"   Links: {' , '.join(links[:25])}")
+        frames = [canon_url(f) for f in _frames(body, url)]
+        if frames:
+            print(f"   Frames: {' , '.join(frames[:6])}")
         n = _n_events(body)
         if n >= 0:
             ds = sorted(re.findall(r"DTSTART[^:]*:(\d{8})", body.decode("utf-8", "replace")))
@@ -223,6 +243,32 @@ def fetch_trainex(cfg, debug=False):
         except (urllib.error.URLError, TimeoutError, OSError) as ex:
             raise SyncError(f"TraiNex nicht erreichbar: {getattr(ex, 'reason', ex)}")
 
+    def dl(step, url, fh, max_bytes, referer=None):
+        """Lädt eine Datei gestreamt nach fh (der Dienst hat nur 128 MB RAM). Liefert die Antwort-Header."""
+        rq = urllib.request.Request(url, headers={"Referer": referer} if referer else {})
+        try:
+            with op.open(rq, timeout=60) as r:
+                size = int(r.headers.get("Content-Length") or 0)
+                if size > max_bytes:
+                    raise TooBig(size)
+                n = 0
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    n += len(chunk)
+                    if n > max_bytes:
+                        raise TooBig(n)
+                    fh.write(chunk)
+                if debug:
+                    print(f"\n── {step}: HTTP {r.status} → {urllib.parse.urlsplit(r.geturl()).path} · {n} Bytes · "
+                          f"{r.headers.get('Content-Type')} · {r.headers.get('Content-Disposition') or '–'}")
+                return r.headers
+        except urllib.error.HTTPError as ex:
+            raise SyncError(f"HTTP {ex.code} beim Download")
+        except (urllib.error.URLError, TimeoutError, OSError) as ex:
+            raise SyncError(f"Download fehlgeschlagen: {getattr(ex, 'reason', ex)}")
+
     if debug:
         print(f"trainex-sync {VERSION}")
     b = cfg.base
@@ -235,6 +281,8 @@ def fetch_trainex(cfg, debug=False):
                        "Content-Type": "application/x-www-form-urlencoded"})
     try:
         body = fetch_export(cfg, req, b)
+        if extra and _n_events(body) >= 0:
+            extra(req, dl)
     finally:
         try:
             req("9 Logout", f"{b}/logout.cfm")
@@ -920,6 +968,675 @@ def build_page(cfg, https_url):
                        webcal_q=q(webcal), https_q=q(https_url), name_q=q(cfg.cal_name)).encode("utf-8")
 
 
+# ───────────────────────── Unterlagen (Lernen → Archiv) ─────────────────────────
+
+# Endungen, die als Dokument gelten und so auf dem Server abgelegt werden (alles andere als .bin,
+# damit z. B. HTML/SVG nie als Webseite unter der eigenen Domain ausgeliefert wird)
+DOC_EXT = {"pdf", "doc", "docx", "ppt", "pptx", "pps", "ppsx", "xls", "xlsx", "odt", "odp", "ods", "rtf", "txt",
+           "csv", "png", "jpg", "jpeg", "gif", "heic", "zip", "mp3", "m4a", "mp4", "mov", "epub", "key", "pages",
+           "numbers"}
+DL_HINT = re.compile(r"(?i)download|datei|dokument|\bdok|anhang|attach|file|upload|(?<![a-z])dl(?![a-z])")
+NOT_DOC = re.compile(r"(?i)navigation|layout|logout|start\.cfm|einsatzplan")
+TOKEN_PARAM = re.compile(r"(?:TokCF19|IDphp17|sec18m)=.*|\d+")
+GENERIC_NAME = re.compile(r"(?i)\W*(download|herunterladen|öffnen|oeffnen|anzeigen|ansehen|datei|dokument|pdf|"
+                          r"link|hier|mehr)?\W*")
+HEADER_WORDS = re.compile(r"(?i)\b(datei(name)?|name|datum|größe|groesse|titel|beschreibung|typ|download|art|"
+                          r"bezeichnung|hochgeladen|dozent(in)?|von|am|aktion(en)?)\b")
+SEM_RANGE = re.compile(r"(\d{1,2})\.(\d{1,2})\.(\d{4})\s*(?:bis|-|–)\s*(\d{1,2})\.(\d{1,2})\.(\d{4})")
+TG_MAX_FILE = 50 * 1024 * 1024  # Limit für Uploads über die Bot-API
+
+
+def _dec(body):
+    if isinstance(body, str):
+        return body
+    try:
+        return body.decode("utf-8")
+    except UnicodeDecodeError:
+        return body.decode("cp1252", "replace")
+
+
+def _text(fragment):
+    t = re.sub(r"(?is)<script.*?</script>|<style.*?</style>|<!--.*?-->", " ", fragment)
+    return norm(html.unescape(re.sub(r"<[^>]+>", " ", t)))
+
+
+def _attr(tag, name):
+    m = re.search(r"""\b%s\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""" % name, tag, re.I)
+    return html.unescape(next(g for g in m.groups() if g is not None)) if m else None
+
+
+def canon_url(u):
+    """URL ohne die zeitabhängigen TraiNex-Tokens – bleibt über Sitzungen hinweg gleich."""
+    p = urllib.parse.urlsplit(u)
+    q = sorted(x for x in p.query.split("&") if x and not TOKEN_PARAM.fullmatch(x))
+    return p.path + ("?" + "&".join(q) if q else "")
+
+
+def with_tok(u):
+    p = urllib.parse.urlsplit(u)
+    q = [x for x in p.query.split("&") if x and not TOKEN_PARAM.fullmatch(x)] + [_tok()]
+    return urllib.parse.urlunsplit(p._replace(query="&".join(q)))
+
+
+def _frames(body, base_url):
+    return [urllib.parse.urljoin(base_url, html.unescape(m))
+            for m in re.findall(r"""(?is)<i?frame\b[^>]*?\bsrc\s*=\s*["']([^"']+)""", _dec(body))]
+
+
+def _urls_in(attrs):
+    """Ziel-URLs eines Links: href, oder bei javascript:/onclick die URL in window.open('…') o. Ä."""
+    out = []
+    for m in re.finditer(r"""\b(href|onclick)\s*=\s*(["'])(.*?)\2""", attrs, re.I | re.S):
+        v = html.unescape(m.group(3)).strip()
+        if m.group(1).lower() == "href" and not re.match(r"(?i)javascript:|#|mailto:", v):
+            out.append(v)
+        else:
+            out += re.findall(r"""["']([^"'\s]+?\.\w{2,5}(?:\?[^"'\s]*)?)["']""", v)
+    return out
+
+
+def _ext(name):
+    tail = (name or "").rsplit("/", 1)[-1]
+    return tail.rsplit(".", 1)[-1].lower() if "." in tail else ""
+
+
+def is_doc_url(u):
+    p = urllib.parse.urlsplit(u)
+    if p.scheme not in ("", "http", "https") or not p.path or NOT_DOC.search(p.path):
+        return False
+    return _ext(p.path) in DOC_EXT or bool(DL_HINT.search(p.path + "?" + p.query))
+
+
+def safe_name(x, limit=120):
+    x = norm(re.sub(r'[\\/:*?"<>|\x00-\x1f]', "-", x or "")).strip(" .")
+    return x[:limit].strip(" .") or "Dokument"
+
+
+def _generic(x):
+    return not x or len(x) < 2 or bool(GENERIC_NAME.fullmatch(x))
+
+
+def _is_header(text):
+    words = re.findall(r"\w+", text)
+    return len(text) <= 80 and len(HEADER_WORDS.findall(text)) >= max(2, len(words) // 2)
+
+
+def url_filename(url):
+    """Dateiname aus dem Link: letzter Pfadteil oder ein Parameter wie Filename=…pdf (TraiNex: datei_laden.cfm)."""
+    p = urllib.parse.urlsplit(url)
+    for c in [urllib.parse.unquote(p.path.rsplit("/", 1)[-1])] + [v for _, v in urllib.parse.parse_qsl(p.query)]:
+        if _ext(c) in DOC_EXT:
+            return c
+    return ""
+
+
+def unwrap(title):
+    """TraiNex bricht lange Namen alle ~25 Zeichen mit „-“ + Umbruch: „…Feinplan- ung“ → „…Feinplanung“.
+    Nur nach langen Wortketten, echte Bindestriche wie „Teil- und …“ bleiben."""
+    return re.sub(r"(\S{20,}?)- (?=\S)", r"\1", title)
+
+
+def clean_section(text):
+    """Abschnittsüberschrift im Archiv ohne Bedienelemente wie „[ auf klappen ]“."""
+    return norm(re.sub(r"\[[^\]]{0,25}\]", " ", text)) or text
+
+
+def module_codes(events):
+    """{"M12": "M12 Biochemie/Molekularbiologie", …} aus den Stundenplan-Terminen."""
+    out = {}
+    for ev in events:
+        m = re.match(r"(M\d{1,2})\b", module_name(ev))
+        if m:
+            out.setdefault(m.group(1).upper(), module_name(ev))
+    return out
+
+
+def module_folder(section, modules):
+    """Ordner für Telegram/Dateien-App: der Modulname aus dem Stundenplan („M12 Biochemie (2/3) - Vorlesung
+    WiSe26“ → „M12 Biochemie/Molekularbiologie“), sonst die Überschrift aus dem Archiv."""
+    m = re.match(r"\s*(M\d{1,2})\b", section or "")
+    return modules.get(m.group(1).upper(), section) if m else (section or "Allgemein")
+
+
+def doc_meta(info):
+    """„3. Sem. ( 02.10.2026 ) Prof. Dr. Kötter, S. PDF (3.30 MB)“ → „02.10.2026 · Prof. Dr. Kötter, S. · 3.30 MB“."""
+    m = re.search(r"\(\s*(\d{2}\.\d{2}\.\d{4})\s*\)\s*(.*?)\s*(?:\b[A-Z]{2,5}\s*)?\(\s*([\d.,]+\s*[KMG]B)\s*\)",
+                  info or "")
+    return " · ".join(x for x in m.groups() if x) if m else ""
+
+
+def doc_title(link_text, title_attr, row_text, url):
+    for c in (link_text, title_attr):
+        if not _generic(c):
+            return unwrap(c)[:150]
+    m = re.search(r"[^\s/\\<>|]+\.(?:%s)\b" % "|".join(sorted(DOC_EXT)), row_text, re.I)
+    if m:
+        return m.group(0)
+    return url_filename(url) or row_text[:80] or "Dokument"
+
+
+def parse_archive(body, page_url):
+    """Dokument-Links der Archiv-Liste. Zeilen ohne Dokument-Link gelten als Überschrift (Ordner/Modul)
+    für die folgenden Dokumente. Liefert [{key, url, title, folder, info}]."""
+    text = re.sub(r"(?is)<script.*?</script>|<style.*?</style>|<!--.*?-->", " ", _dec(body))
+    own = urllib.parse.urlsplit(page_url).path
+    splitter = r"(?is)<tr\b.*?(?=<tr\b|</table>|\Z)" if re.search(r"(?i)<tr\b", text) \
+        else r"(?is)<(?:li|div|p|h\d)\b.*?(?=<(?:li|div|p|h\d)\b|\Z)"
+    docs, seen, folder = [], {}, ""
+    for row in re.findall(splitter, text):
+        links = []
+        for m in re.finditer(r"(?is)<a\b([^>]*)>(.*?)</a>", row):
+            for u in _urls_in(m.group(1)):
+                full = urllib.parse.urljoin(page_url, u)
+                p = urllib.parse.urlsplit(full)
+                if is_doc_url(full) and (p.path != own or DL_HINT.search(p.query)):
+                    links.append((full, _text(m.group(2)), _attr(m.group(1), "title") or ""))
+                    break
+        rtext = _text(row)
+        if not links:
+            if 0 < len(rtext) <= 150 and not re.search(r"(?i)<th\b|<input|<select|<form", row) \
+                    and not _is_header(rtext):
+                folder = clean_section(rtext)
+            continue
+        for full, ltxt, ttl in links:
+            key = canon_url(full)
+            title = doc_title(ltxt, ttl, rtext, full)
+            if key in seen:  # dasselbe Dokument zweimal verlinkt (Symbol + Name)
+                if _generic(seen[key]["title"]) or seen[key]["title"] == rtext[:80]:
+                    seen[key]["title"] = title
+                continue
+            info = norm(rtext.replace(ltxt, " ")) if ltxt else rtext
+            seen[key] = d = {"key": key, "url": full, "title": title, "folder": folder, "info": info[:300]}
+            docs.append(d)
+    return docs
+
+
+def _sem_num(label):
+    """„3.“ / „3. Semester“ / „3. Semester: 01.10.2026 bis …“ → 3; „alle“ → None."""
+    m = re.match(r"\s*(\d{1,2})\s*\.?\s*(?:Semester\b|:|$)", label, re.I)
+    return int(m.group(1)) if m else None
+
+
+def _in_range(m, today):
+    a = dt.date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    z = dt.date(int(m.group(6)), int(m.group(5)), int(m.group(4)))
+    return a <= today <= z
+
+
+def semester_hint(text, today):
+    """Nummer aus einem Hinweis wie „3. Semester: 01.10.2026 bis 31.03.2027“, dessen Zeitraum heute enthält."""
+    for m in re.finditer(r"(\d{1,2})\.\s*Semester[^0-9<]{0,12}(" + SEM_RANGE.pattern + ")", text, re.I):
+        if _in_range(SEM_RANGE.search(m.group(2)), today):
+            return int(m.group(1))
+    return None
+
+
+def pick_semester(options, today, want="", page=""):
+    """options: [(value, label, selected, attrs)]. Reihenfolge: DOCS_SEMESTER; Option, deren Zeitraum
+    (im Text oder z. B. im title) heute enthält; Zeitraum-Hinweis irgendwo auf der Seite; Vorauswahl.
+    Liefert (value, „3. Semester“) oder None. „alle“ wird nie gewählt."""
+    opts = [(v, _sem_num(lab) or (int(v) if v.isdigit() and _sem_num(lab + ".") else None), sel, lab + " " + a)
+            for v, lab, sel, a in options]
+    opts = [o for o in opts if o[1]]
+    found = None
+    if want:
+        found = next((o for o in opts if str(o[1]) == want or o[0] == want), None)
+    else:
+        for o in opts:
+            m = SEM_RANGE.search(html.unescape(o[3]))
+            if m and _in_range(m, today):
+                found = o
+                break
+        if not found:
+            n = semester_hint(html.unescape(page), today)
+            found = next((o for o in opts if o[1] == n), None) if n else None
+        if not found:
+            found = next((o for o in opts if o[2]), None)
+    return (found[0], f"{found[1]}. Semester") if found else None
+
+
+def semester_form(body, page_url, today, want=""):
+    """Formular mit der Semester-Auswahl (TraiNex: „Nur [1.|2.|3.|alle] Semester“ + „anzeigen“).
+    Liefert (method, url, data, label) oder None."""
+    page = _dec(body)
+    for fm in re.finditer(r"(?is)<form\b([^>]*)>(.*?)</form>", page):
+        attrs, inner = fm.groups()
+        target = None
+        for sm in re.finditer(r"(?is)<select\b([^>]*)>(.*?)</select>", inner):
+            opts = []
+            for o in re.finditer(r"(?is)<option\b([^>]*)>(.*?)(?=<option\b|\Z)", sm.group(2)):
+                label = _text(o.group(2))
+                v = _attr(o.group(1), "value")
+                opts.append((label if v is None else v, label, bool(re.search(r"(?i)\bselected\b", o.group(1))),
+                             o.group(1)))
+            if not (re.search(r"(?i)sem", _attr(sm.group(1), "name") or "")
+                    or any(re.search(r"(?i)semester", x[1]) for x in opts)):
+                continue
+            pick = pick_semester(opts, today, want, page)
+            if pick:
+                target = (_attr(sm.group(1), "name"), pick)
+                break
+        if not target:
+            continue
+        sel_name, (sel_val, label) = target
+        fields, radios, submits = [], {}, []
+        for m in re.finditer(r"(?is)<(input|select|button)\b([^>]*)>", inner):
+            tag, a = m.group(1).lower(), m.group(2)
+            name = _attr(a, "name")
+            if not name:
+                continue
+            typ = (_attr(a, "type") or ("submit" if tag == "button" else "text")).lower()
+            if tag == "select":
+                if name == sel_name:
+                    fields.append((name, sel_val))
+                    continue
+                body_sel = inner[m.end():inner.find("</select>", m.end())]
+                os_ = re.findall(r"(?is)<option\b([^>]*)>([^<]*)", body_sel)
+                chosen = next((o for o in os_ if re.search(r"(?i)\bselected\b", o[0])), os_[0] if os_ else None)
+                if chosen:
+                    v = _attr(chosen[0], "value")
+                    fields.append((name, norm(html.unescape(chosen[1])) if v is None else v))
+            elif typ == "radio":
+                stop = r"(?i)<(?:input|select|br|/?td|/label|/div|/p)\b"
+                lab = _text(re.split(stop, inner[m.end():m.end() + 300])[0])
+                if not re.search(r"(?i)semester|alle|nur", lab):
+                    lab = _text(re.split(stop, inner[max(0, m.start() - 300):m.start()])[-1])
+                radios.setdefault(name, []).append(
+                    (_attr(a, "value") or "on", lab, bool(re.search(r"(?i)\bchecked\b", a))))
+            elif typ == "checkbox":
+                if re.search(r"(?i)\bchecked\b", a):
+                    fields.append((name, _attr(a, "value") or "on"))
+            elif typ in ("submit", "image"):
+                txt = _attr(a, "value") or _text(inner[m.end():inner.find("</button>", m.end())]
+                                                  if tag == "button" else "")
+                submits.append((name, _attr(a, "value") or "", typ, txt))
+            elif typ not in ("reset", "file", "button"):
+                fields.append((name, _attr(a, "value") or ""))
+        for name, opts in radios.items():
+            sem = [o for o in opts if re.search(r"(?i)semester", o[1])]
+            want_r = (next((o for o in sem if re.match(r"(?i)\s*nur\b", o[1])), None)
+                      or next((o for o in sem if not re.search(r"(?i)\balle\b", o[1])), None))
+            if want_r:
+                fields.append((name, want_r[0]))
+            else:
+                cur = next((o for o in opts if o[2]), None)
+                if cur:
+                    fields.append((name, cur[0]))
+        sub = (next((x for x in submits if norm(x[3] + " " + x[1]).lower() in ("anzeigen", "anzeigen anzeigen")), None)
+               or next((x for x in submits if re.search(r"(?i)anzeigen", x[3] + x[1])
+                        and not re.search(r"(?i)alle", x[3] + x[1])), None)
+               or (submits[0] if submits else None))
+        if sub:
+            if sub[2] == "image":
+                fields += [(sub[0] + ".x", "1"), (sub[0] + ".y", "1")]
+            else:
+                fields.append((sub[0], sub[1]))
+        method = (_attr(attrs, "method") or "get").upper()
+        action = urllib.parse.urljoin(page_url, _attr(attrs, "action") or page_url)
+        data = urllib.parse.urlencode(fields)
+        if method == "GET":
+            return "GET", action.split("?")[0] + "?" + data, None, label
+        return "POST", action, data.encode(), label
+    return None
+
+
+def find_archive(cfg, req, b):
+    """URL der Archiv-Seite (Lernen → Archiv). Im Menü heißt der Bereich „Lernen“, intern „Kursraum“."""
+    if cfg.docs_url:
+        return with_tok(urllib.parse.urljoin(b + "/", cfg.docs_url))
+    nav = f"{b}/navigation/student_layout.cfm?{_tok()}&area=Kursraum&subarea=archiv"
+    _, _, page = req("D1 Archiv (Navigation)", nav)
+    for step in ("D1b", "D1c"):
+        hit = (next((f for f in _frames(page, nav) if re.search(r"(?i)archiv", f) and not NOT_DOC.search(f)), None)
+               or _find_url(page, nav, r"archiv\w*\.cfm", exclude=r"navigation|layout"))
+        if hit:
+            return hit
+        link = None
+        for m in re.finditer(r"(?is)<a\b([^>]*)>(.*?)</a>", _dec(page)):
+            if re.fullmatch(r"(?i)archiv", _text(m.group(2))) and _urls_in(m.group(1)):
+                link = urllib.parse.urljoin(nav, _urls_in(m.group(1))[0])
+                break
+        if not link:
+            break
+        if not re.search(r"(?i)navigation|layout", link):
+            return link
+        nav = link
+        _, _, page = req(f"{step} Archiv (Menü)", nav)
+    raise SyncError("Archiv-Seite (Lernen → Archiv) nicht gefunden. Details: sudo ./install.sh debug")
+
+
+def _page(r):
+    """(status, headers, body) → Text im angegebenen Zeichensatz (das Archiv ist ISO-8859-1)."""
+    cs = r[1].get_content_charset() if r[1] is not None else None
+    try:
+        return r[2].decode(cs) if cs else _dec(r[2])
+    except (LookupError, UnicodeDecodeError):
+        return _dec(r[2])
+
+
+def _submit(req, step, method, target, data, referer):
+    hdr = {"Referer": referer}
+    if method == "POST":
+        hdr["Content-Type"] = "application/x-www-form-urlencoded"
+    return _page(req(step, target, data, hdr))
+
+
+def fetch_archive(cfg, req, today, cache=None):
+    """Archiv öffnen, „Nur Semester“ + aktuelles Semester wählen, „anzeigen“. Ohne Filter zeigt TraiNex alle
+    Semester, „anzeigen“ ist also immer nötig. Liefert (Liste, Semester, URL, Cache).
+    Mit Cache (Formular aus dem letzten Lauf) wird direkt „anzeigen“ geschickt: 1 statt 3 Seitenabrufe.
+    Die Antwort enthält das Formular erneut; passt das Semester nicht mehr (Semesterwechsel) oder fehlt es,
+    geht es den normalen Weg."""
+    if cache:
+        try:
+            target = with_tok(urllib.parse.urljoin(cfg.base + "/", cache["url"]))
+            if cache["method"] == "GET":
+                target = target.replace("?", "?" + cache["data"] + "&", 1)
+            page = _submit(req, "D3 anzeigen (direkt)", cache["method"], target,
+                           cache["data"].encode() if cache["method"] == "POST" else None, target)
+            form = semester_form(page, target, today, cfg.docs_semester)
+            if form and form[3] == cache["label"]:
+                return parse_archive(page, target), cache["label"], target, cache
+            log("Archiv: Direktabruf passt nicht mehr – normaler Weg")
+        except SyncError as ex:
+            log("Archiv: Direktabruf fehlgeschlagen –", ex)
+    url = find_archive(cfg, req, cfg.base)
+    page = _page(req("D2 Archiv", url))
+    form = semester_form(page, url, today, cfg.docs_semester)
+    if not form:
+        raise SyncError("Semester-Auswahl im Archiv nicht gefunden"
+                        + (f" (DOCS_SEMESTER={cfg.docs_semester})" if cfg.docs_semester else "")
+                        + ". Fest einstellen mit DOCS_SEMESTER=3 in der .env. Details: sudo ./install.sh debug")
+    method, target, data, label = form
+    page = _submit(req, "D3 anzeigen", method, target, data, url)
+    if method == "GET":
+        p = urllib.parse.urlsplit(target)
+        cache = {"method": "GET", "url": p.path,
+                 "data": "&".join(x for x in p.query.split("&") if x and not TOKEN_PARAM.fullmatch(x))}
+    else:
+        cache = {"method": "POST", "url": canon_url(target), "data": data.decode()}
+    cache["label"] = label
+    return parse_archive(page, target), label, target, cache
+
+
+def doc_id(key):
+    return hashlib.sha1(key.encode()).hexdigest()[:12]
+
+
+def plan_docs(items, listing, skip=()):
+    """Ordnet die Archiv-Liste gespeicherten Dokumenten zu: erst über den Link, dann (neu hochgeladene
+    Fassung mit neuem Link) über Ordner + Titel. Liefert (pairs[(id, d)], neu[d], entfernt[id])."""
+    by_key = {v["key"]: k for k, v in items.items()}
+    pairs, rest, used = [], [], set()
+    for d in listing:
+        if d["key"] in skip:
+            continue
+        k = by_key.get(d["key"])
+        if k and k not in used:
+            pairs.append((k, d)); used.add(k)
+        else:
+            rest.append(d)
+    new = []
+    for d in rest:
+        k = next((k for k, v in items.items() if k not in used
+                  and v["folder"] == d["folder"] and v["title"] == d["title"]), None)
+        if k:
+            pairs.append((k, d)); used.add(k)
+        else:
+            new.append(d)
+    return pairs, new, [k for k in items if k not in used]
+
+
+def file_ext(headers, url, title):
+    fn = None
+    if headers is not None:
+        fn = headers.get_filename()
+        if fn:
+            try:
+                fn = fn.encode("latin-1").decode("utf-8")  # rohes UTF-8 im Header
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                pass
+    for c in (fn, url_filename(url), title):
+        if _ext(c) in DOC_EXT:
+            return _ext(c), fn
+    ct = (headers.get_content_type() if headers is not None else "") or ""
+    guess = (mimetypes.guess_extension(ct) or "").lstrip(".")
+    return (guess if guess in DOC_EXT else (_ext(fn) or "bin")), fn
+
+
+def display_name(title, ext, cd_name):
+    """Dateiname für Telegram/iCloud: Titel aus TraiNex + Endung (Titel sind lesbarer als Upload-Namen)."""
+    base = title if not _generic(title) else (cd_name or "Dokument")
+    base = safe_name(base)
+    if ext and ext != "bin" and _ext(base) != ext:
+        base = f"{base}.{ext}"
+    return base
+
+
+def sync_docs(old, listing, label, now, grab=None, force=False):
+    """Gleicht die Archiv-Liste mit dem gespeicherten Stand ab und lädt neue/geänderte Dateien über
+    grab(d, item) → {sha, file, ext, cd, size} | {"big": Bytes} | {"html": True} (None = Probelauf).
+    Liefert (state_neu, entries[(typ, item)], info)."""
+    items = {k: dict(v) for k, v in old.get("items", {}).items()}
+    skip = set(old.get("skip", []))
+    sem_changed = bool(items) and old.get("semester") != label
+    first = not items or sem_changed
+    if sem_changed:
+        items = {}
+    pairs, new, removed = plan_docs(items, listing, skip)
+    if not first and not force:
+        if not listing:
+            raise SyncError(f"Archiv-Liste ist leer ({len(items)} Dokumente gespeichert) – nichts geändert. "
+                            "Falls korrekt: /sync force")
+        if len(removed) > max(3, len(items) // 2):
+            raise SyncError(f"{len(removed)} von {len(items)} Dokumenten würden entfallen – nichts geändert. "
+                            "Falls korrekt: /sync force")
+    ts = int(now.timestamp())
+    entries, failed = [], 0
+
+    def fetch(d, item):
+        nonlocal failed
+        if grab is None:
+            return None
+        try:
+            got = grab(d, item)
+        except SyncError as ex:
+            log(f"Download fehlgeschlagen ({d['title']}):", ex)
+            failed += 1
+            return False
+        if got.get("html"):  # Link führt auf eine Seite, nicht auf eine Datei → künftig überspringen
+            skip.add(d["key"])
+            return False
+        return got
+
+    for k, d in pairs:
+        o = items[k]
+        changed = d["key"] != o["key"] or d["info"] != o["info"] or not o.get("present", True)
+        o.update(title=d["title"], folder=d["folder"], module=d.get("module") or d["folder"])
+        if not changed:
+            continue
+        got = fetch(d, o)
+        if got is None:
+            entries.append(("upd?", o))
+        elif got:  # erst nach erfolgreichem Download übernehmen, sonst im nächsten Lauf erneut
+            o.update(key=d["key"], info=d["info"])
+            prev = o.get("sha")
+            if got.get("big"):
+                o.update(big=got["big"], sha=None, file=None)
+            else:
+                o.update(sha=got["sha"], file=got["file"], size=got["size"], big=0,
+                         name=display_name(d["title"], got["ext"], got.get("cd")))
+            o["present"] = True
+            if prev != o.get("sha") or got.get("big"):
+                o["changed"] = ts
+                entries.append(("upd", o))
+    for d in new:
+        item = {"id": doc_id(d["key"]), "key": d["key"], "title": d["title"], "folder": d["folder"],
+                "module": d.get("module") or d["folder"],
+                "info": d["info"], "added": ts, "changed": ts, "present": True}
+        got = fetch(d, item)
+        if got is False:
+            continue
+        if got:
+            if got.get("big"):
+                item.update(big=got["big"], sha=None, file=None, name=display_name(d["title"], _ext(d["title"]), None))
+            else:
+                item.update(sha=got["sha"], file=got["file"], size=got["size"], big=0,
+                            name=display_name(d["title"], got["ext"], got.get("cd")))
+        while item["id"] in items:
+            item["id"] = doc_id(item["id"] + d["key"])
+        items[item["id"]] = item
+        if not first:
+            entries.append(("new", item))
+    gone = []
+    for k in removed:
+        gone.append(items.pop(k))
+        if not first:
+            entries.append(("del", gone[-1]))
+    state = {"semester": label, "items": items, "skip": sorted(skip), "checked": ts}
+    return state, entries, {"first": first, "sem_changed": sem_changed, "failed": failed,
+                            "listed": len(listing), "removed": gone}
+
+
+def doc_group(it):
+    return it.get("module") or it.get("folder") or "Allgemein"
+
+
+def doc_paths(items):
+    """Pfad je Dokument für den Spiegel in der Dateien-App: „Ordner/Name“, doppelte Namen mit (2), (3) …"""
+    out, used = {}, set()
+    for it in sorted(items.values(), key=lambda x: (x.get("added", 0), x["id"])):
+        folder = safe_name(doc_group(it), 80)
+        name = it.get("name") or safe_name(it["title"])
+        stem, dot, ext = name.rpartition(".") if "." in name else (name, "", "")
+        p, n = f"{folder}/{name}", 2
+        while p.lower() in used:
+            p = f"{folder}/{stem} ({n}){dot}{ext}"; n += 1
+        used.add(p.lower())
+        out[it["id"]] = p
+    return out
+
+
+def fmt_size(n):
+    return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{max(1, n // 1024)} KB"
+
+
+def build_docs_json(docs, base_url, updated):
+    paths = doc_paths(docs.get("items", {}))
+    files = []
+    for it in sorted(docs.get("items", {}).values(), key=lambda x: paths[x["id"]].lower()):
+        if not it.get("file"):
+            continue
+        files.append({"path": paths[it["id"]], "folder": paths[it["id"]].split("/")[0],
+                      "name": paths[it["id"]].split("/", 1)[1], "url": f"{base_url}/f/{it['file']}",
+                      "size": it.get("size", 0), "added": it.get("added", 0), "changed": it.get("changed", 0)})
+    data = {"semester": docs.get("semester", ""), "updated": int(updated), "files": files}
+    return json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
+
+
+DOCS_PAGE = """<!doctype html>
+<html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<meta name="color-scheme" content="light dark">
+<title>Unterlagen</title>
+<style>
+:root{{--bg:#f5f5f7;--card:#fff;--fg:#1d1d1f;--mut:#6e6e73;--acc:#0071e3;--line:#d2d2d7}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#000;--card:#1c1c1e;--fg:#f5f5f7;--mut:#98989d;--acc:#0a84ff;--line:#38383a}}}}
+*{{box-sizing:border-box}}
+body{{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:24px 16px}}
+main{{max-width:640px;margin:0 auto}}
+.card{{background:var(--card);border-radius:18px;padding:18px 20px;margin-bottom:16px}}
+h1{{font-size:24px;margin:0 0 4px}} h2{{font-size:17px;margin:0 0 8px}}
+p,.m{{color:var(--mut)}} p{{margin:0}} .m{{font-size:13px;white-space:nowrap}}
+ul{{list-style:none;margin:0;padding:0}} li{{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid var(--line)}}
+li:first-child{{border-top:0}} a{{color:var(--acc);text-decoration:none;word-break:break-word}}
+.new{{background:var(--acc);color:#fff;border-radius:6px;font-size:11px;padding:1px 6px;margin-left:6px;vertical-align:2px}}
+</style></head><body><main>
+<div class="card"><h1>📚 Unterlagen</h1><p>{semester} · {n} Dokumente · Stand {updated}</p></div>
+{folders}
+</main></body></html>
+"""
+
+
+def build_docs_page(docs, updated):
+    paths = doc_paths(docs.get("items", {}))
+    groups = {}
+    for it in docs.get("items", {}).values():
+        groups.setdefault(paths[it["id"]].split("/")[0], []).append(it)
+    cards = []
+    for folder in sorted(groups, key=str.lower):
+        rows = []
+        for it in sorted(groups[folder], key=lambda x: paths[x["id"]].lower()):
+            name = paths[it["id"]].split("/", 1)[1]
+            badge = '<span class="new">neu</span>' if updated - it.get("changed", 0) < 7 * 86400 else ""
+            when = dt.datetime.fromtimestamp(it.get("changed", 0), TZ).strftime("%d.%m.%Y")
+            if it.get("file"):
+                link = f'<a href="f/{e(it["file"])}" download="{html.escape(name)}">{e(name)}</a>'
+                meta = f"{when} · {fmt_size(it.get('size', 0))}"
+            else:
+                link = e(name)
+                meta = f"{when} · zu groß, nur im TraiNex"
+            rows.append(f'<li><span>{link}{badge}</span><span class="m">{meta}</span></li>')
+        cards.append(f'<div class="card"><h2>{e(folder)}</h2><ul>{"".join(rows)}</ul></div>')
+    return DOCS_PAGE.format(semester=e(docs.get("semester") or "–"), n=len(docs.get("items", {})),
+                            updated=dt.datetime.fromtimestamp(updated, TZ).strftime("%d.%m.%Y %H:%M"),
+                            folders="\n".join(cards) or '<div class="card"><p>Noch keine Dokumente.</p></div>'
+                            ).encode("utf-8")
+
+
+def format_doc_caption(typ, it):
+    head = {"new": "📄 <b>Neues Dokument</b>", "upd": "🔁 <b>Dokument aktualisiert</b>"}[typ]
+    text = f"{head} · {e(doc_group(it))}\n{e(it.get('name') or it['title'])}"
+    meta = doc_meta(it.get("info"))
+    if meta:
+        text += f"\n{e(meta)}"
+    big = it.get("big") or (it.get("size", 0) > TG_MAX_FILE and it["size"])
+    if big:
+        text += f"\n⚠️ Zu groß für Telegram ({fmt_size(big)}) – bitte im TraiNex herunterladen."
+    return text
+
+
+class _Hashing:
+    def __init__(self, fh, h):
+        self.fh, self.h = fh, h
+
+    def write(self, chunk):
+        self.h.update(chunk)
+        self.fh.write(chunk)
+
+
+def download_doc(dl, d, store, max_bytes, referer=None):
+    """Lädt ein Dokument nach store/<sha256>.<endung> (gleicher Inhalt = gleiche Datei)."""
+    fd, tmp = tempfile.mkstemp(dir=store, prefix=".dl-")
+    try:
+        h = hashlib.sha256()
+        with os.fdopen(fd, "wb") as f:
+            try:
+                hdr = dl(f"D4 {d['title'][:40]}", d["url"], _Hashing(f, h), max_bytes, referer)
+            except TooBig as ex:
+                return {"big": ex.size}
+        if hdr.get_content_type() == "text/html" and not hdr.get_filename():
+            return {"html": True}
+        ext, cd = file_ext(hdr, d["url"], d["title"])
+        sha = h.hexdigest()
+        name = f"{sha[:32]}.{ext if ext in DOC_EXT else 'bin'}"
+        size = os.path.getsize(tmp)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, os.path.join(store, name))
+        return {"sha": sha, "file": name, "ext": ext, "cd": cd, "size": size}
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def format_doc_removed(items):
+    lines = [f"🗑 <b>Dokument{'e' if len(items) > 1 else ''} entfernt</b>"]
+    lines += [f"• {e(it.get('name') or it['title'])}" + f" ({e(doc_group(it))})"
+              for it in items]
+    return "\n".join(lines)
+
+
 # ───────────────────────── State ─────────────────────────
 
 class State:
@@ -936,6 +1653,7 @@ class State:
         s.setdefault("interval", cfg.default_interval)
         s.setdefault("token", "")
         s.setdefault("channels", [])
+        s.setdefault("docs_token", "")
         self.d.setdefault("fails", 0)
         self.d.setdefault("absences", {})  # uid -> "all" | Minuten
 
@@ -957,6 +1675,33 @@ class TG:
         data = json.dumps(params).encode()
         rq = urllib.request.Request(self.url + method, data=data,
                                     headers={"Content-Type": "application/json", "User-Agent": UA})
+        return self._do(method, rq, http_timeout)
+
+    def upload(self, method, field, path, filename, http_timeout=180, **params):
+        """multipart/form-data, Datei gestreamt (nicht komplett im Speicher)."""
+        bd = secrets.token_hex(16)
+        head = b"".join(f'--{bd}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+                        for k, v in params.items())
+        fn = re.sub(r'["\r\n]', "'", filename)
+        head += (f'--{bd}\r\nContent-Disposition: form-data; name="{field}"; filename="{fn}"\r\n'
+                 "Content-Type: application/octet-stream\r\n\r\n").encode()
+        tail = f"\r\n--{bd}--\r\n".encode()
+
+        def body():
+            yield head
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+            yield tail
+        size = len(head) + os.path.getsize(path) + len(tail)
+        rq = urllib.request.Request(self.url + method, data=body(), headers={
+            "Content-Type": f"multipart/form-data; boundary={bd}", "Content-Length": str(size), "User-Agent": UA})
+        return self._do(method, rq, http_timeout)
+
+    def _do(self, method, rq, http_timeout):
         try:
             with urllib.request.urlopen(rq, timeout=http_timeout) as r:
                 res = json.load(r)
@@ -991,6 +1736,15 @@ class TG:
                     log("Telegram-Sendefehler:", ex)
                     time.sleep(2 * (attempt + 1))
 
+    def send_document(self, chat, caption, path=None, filename=None, file_id=None):
+        """Schickt eine Datei (oder eine schon hochgeladene per file_id). Liefert die file_id zum Weiterverwenden."""
+        opts = {"chat_id": chat, "caption": caption[:1024], "parse_mode": "HTML"}
+        if file_id:
+            res = self.call("sendDocument", document=file_id, **opts)
+        else:
+            res = self.upload("sendDocument", "document", path, filename, **opts)
+        return ((res or {}).get("document") or {}).get("file_id")
+
     def edit(self, chat, msg_id, text, markup=None):
         """Ersetzt eine Nachricht (für Buttons). Zu lange Texte gehen als neue Nachricht raus."""
         if len(text) > 4096:
@@ -1006,6 +1760,8 @@ class TG:
 # ───────────────────────── Sync-Kern ─────────────────────────
 
 class App:
+    SEND_PAUSE = 1.0  # Sekunden zwischen Dateien (Telegram erlaubt ~20 Nachrichten/min pro Kanal)
+
     def __init__(self, cfg):
         self.cfg = cfg
         self.st = State(cfg)
@@ -1069,8 +1825,10 @@ class App:
         t0 = time.time()
         now = dt.datetime.now(TZ)
         run = {"time": t0, "source": source}
+        docs = {"manual": source == "manual"}
+        extra = (lambda req, dl: self.docs_fetch(docs, force, req, dl)) if self.cfg.docs else None
         try:
-            new = parse_ics(fetch_trainex(self.cfg))
+            new = parse_ics(fetch_trainex(self.cfg, extra=extra))
             events, entries, info = compute(self.st.d, new, now, force)
         except Exception as ex:
             msg = str(ex) if isinstance(ex, SyncError) else f"Interner Fehler: {ex!r}"
@@ -1082,6 +1840,7 @@ class App:
             # Nur beim ersten Fehler einer Serie (oder bei manuellem Sync) melden
             if self.st.d["fails"] == 1 or source == "manual":
                 self.notify_admin(f"⚠️ <b>Sync fehlgeschlagen</b>\n{e(msg)}")
+            run["docs"] = self.docs_apply(docs)
             return run
         recovered = self.st.d["fails"] > 0
         self.st.d["fails"] = 0
@@ -1114,7 +1873,151 @@ class App:
                     self.tg.send(self.cfg.admin, text)
         if recovered:
             self.notify_admin("✅ Sync funktioniert wieder.")
+        run["docs"] = self.docs_apply(docs)
         return run
+
+    # ── Unterlagen ──
+    def docs_token(self):
+        s = self.st.settings
+        if not s.get("docs_token"):
+            s["docs_token"] = secrets.token_urlsafe(24)
+            self.st.save()
+        return s["docs_token"]
+
+    def docs_dir(self, tok=None):
+        return os.path.join(self.cfg.web_dir, "d", tok or self.docs_token())
+
+    def docs_url(self):
+        return f"{self.cfg.public_url}/d/{self.docs_token()}"
+
+    def docs_fetch(self, box, force, req, dl):
+        """Läuft in der TraiNex-Sitzung direkt nach dem Stundenplan: Archiv-Liste holen, abgleichen und
+        nur neue/geänderte Dateien laden. Fehler hier lassen den Stundenplan-Sync unberührt."""
+        try:
+            now = dt.datetime.now(TZ)
+            old = self.st.d.get("docs", {})
+            listing, label, page, form = fetch_archive(self.cfg, req, now.date(), old.get("form"))
+            modules = module_codes(self.st.d["events"])
+            for d in listing:
+                d["module"] = module_folder(d["folder"], modules)
+            store = os.path.join(self.docs_dir(), "f")
+            os.makedirs(store, exist_ok=True)
+            for it in old.get("items", {}).values():
+                if it.get("file") and not os.path.exists(os.path.join(store, it["file"])):
+                    it["present"] = False  # z. B. Webordner geleert → still neu laden
+            box["result"] = sync_docs(old, listing, label, now,
+                                      lambda d, item: download_doc(dl, d, store, self.cfg.docs_max, page), force)
+            box["result"][0]["form"] = form
+        except Exception as ex:
+            box["error"] = str(ex) if isinstance(ex, SyncError) else f"Interner Fehler: {ex!r}"
+
+    def docs_apply(self, box):
+        """Übernimmt das Ergebnis von docs_fetch, schreibt Übersicht/Feed und meldet Änderungen.
+        Liefert eine Kurzinfo für /sync."""
+        d = self.st.d
+        if "error" in box:
+            d["docs_fails"] = d.get("docs_fails", 0) + 1
+            d["docs_error"] = box["error"]
+            self.st.save()
+            log("Unterlagen fehlgeschlagen:", box["error"])
+            if d["docs_fails"] == 1 or box.get("manual"):
+                self.notify_admin(f"⚠️ <b>Unterlagen-Abgleich fehlgeschlagen</b>\n{e(box['error'])}")
+            return "Fehler"
+        if "result" not in box:
+            return ""
+        state, entries, info = box["result"]
+        recovered = d.get("docs_fails", 0) > 0
+        d["docs_fails"] = 0
+        d.pop("docs_error", None)
+        d["docs"] = state
+        if entries:
+            d["docs_last"] = {"time": state["checked"],
+                              "items": [[t, it.get("name") or it["title"], doc_group(it)]
+                                        for t, it in entries][:15]}
+        self.st.save()
+        self.publish_docs()
+        n = {t: sum(1 for x, _ in entries if x == t) for t in ("new", "upd", "del")}
+        log(f"Unterlagen ok: {info['listed']} in der Liste, {n['new']} neu, {n['upd']} geändert, "
+            f"{n['del']} entfernt" + (f", {info['failed']} Download(s) fehlgeschlagen" if info["failed"] else ""))
+        if info["first"]:
+            what = "Semesterwechsel – Unterlagen" if info["sem_changed"] else "Erstimport Unterlagen"
+            self.notify_admin(f"📚 <b>{what}:</b> {len(state['items'])} Dokumente\n{e(state['semester'])}\n"
+                              f'<a href="{e(self.docs_url())}/">Übersicht öffnen</a> · Details: /docs')
+        elif entries:
+            self.announce_docs(entries)
+        if recovered:
+            self.notify_admin("✅ Unterlagen-Abgleich funktioniert wieder.")
+        parts = [f"{n['new']} neu" if n["new"] else "", f"{n['upd']} geändert" if n["upd"] else "",
+                 f"{n['del']} entfernt" if n["del"] else ""]
+        return ", ".join(x for x in parts if x) or ("Erstimport" if info["first"] else "keine Änderungen")
+
+    def announce_docs(self, entries):
+        """Neue/geänderte Dateien als Dokument in alle Kanäle (sonst an dich), Löschungen gesammelt als Text."""
+        targets = [c["id"] for c in self.channels()] or [self.cfg.admin]
+        store = os.path.join(self.docs_dir(), "f")
+        for typ, it in entries:
+            if typ not in ("new", "upd"):
+                continue
+            cap = format_doc_caption(typ, it)
+            path = os.path.join(store, it["file"]) if it.get("file") else None
+            fid = None
+            for chat in targets:
+                try:
+                    if path and it.get("size", 0) <= TG_MAX_FILE:
+                        fid = self.tg.send_document(chat, cap, path, it["name"], fid) or fid
+                    else:
+                        self.tg.send(chat, cap)
+                except Exception as ex:
+                    log("Telegram-Dokument:", ex)
+                    self.tg.send(chat, cap)
+                time.sleep(self.SEND_PAUSE)
+        removed = [it for typ, it in entries if typ == "del"]
+        if removed:
+            for chat in targets:
+                self.tg.send(chat, format_doc_removed(removed))
+
+    def publish_docs(self):
+        """Übersichtsseite + Feed für den Kurzbefehl schreiben, nicht mehr benötigte Dateien löschen."""
+        docs = self.st.d.get("docs")
+        if not docs:
+            return
+        base = self.docs_dir()
+        store = os.path.join(base, "f")
+        os.makedirs(store, exist_ok=True)
+        write_atomic(os.path.join(base, "index.json"),
+                     build_docs_json(docs, self.docs_url(), docs.get("checked", time.time())))
+        write_atomic(os.path.join(base, "index.html"), build_docs_page(docs, time.time()))
+        keep = {it["file"] for it in docs["items"].values() if it.get("file")}
+        for f in os.listdir(store):
+            if f not in keep and not f.startswith(".dl-"):
+                try:
+                    os.remove(os.path.join(store, f))
+                except OSError:
+                    pass
+
+    def docs_text(self):
+        if not self.cfg.docs:
+            return "📚 Unterlagen-Abgleich ist aus (<code>DOCS=0</code> in der .env)."
+        docs, d = self.st.d.get("docs"), self.st.d
+        ft = lambda t: dt.datetime.fromtimestamp(t, TZ).strftime("%d.%m. %H:%M")
+        if not docs:
+            return ("📚 Noch keine Unterlagen abgeglichen."
+                    + (f"\n⚠️ {e(d['docs_error'])}" if d.get("docs_error") else "\nDer nächste Sync holt sie (/sync)."))
+        items = docs["items"].values()
+        L = [f"📚 <b>Unterlagen</b> · {e(docs['semester'])}",
+             f"{len(docs['items'])} Dokumente in {len({doc_group(x) for x in items})} Ordnern · "
+             f"geprüft {ft(docs['checked'])}"]
+        if d.get("docs_error"):
+            L.append(f"⚠️ Letzter Abgleich fehlgeschlagen: {e(d['docs_error'])}")
+        L += ["", f'<a href="{e(self.docs_url())}/">Übersicht öffnen</a> (alle Dateien zum Herunterladen)',
+              f"Feed für den Kurzbefehl (Dateien-App):\n<code>{e(self.docs_url())}/index.json</code>"]
+        last = d.get("docs_last")
+        if last:
+            icon = {"new": "📄", "upd": "🔁", "del": "🗑"}
+            L += ["", f"<b>Zuletzt geändert</b> ({ft(last['time'])}):"]
+            L += [f"{icon.get(t, '•')} {e(n)}" + (f" · {e(f)}" if f else "") for t, n, f in last["items"]]
+        L += ["", "Die Links sind privat – nicht weitergeben. Neue Links: /docs newurl"]
+        return "\n".join(L)
 
     # ── Zeitplan ──
     def in_quiet(self, t):
@@ -1186,6 +2089,12 @@ class App:
         if up:
             nx = min(up, key=lambda x: x["s"])
             L.append(f"Nächster Termin: {fmt_day(nx)} {fmt_time(nx)} · {e(short(nx))} ({e(room(nx))})")
+        docs = d.get("docs")
+        if not self.cfg.docs:
+            L.append("Unterlagen: aus")
+        elif docs:
+            L.append(f"Unterlagen: {len(docs['items'])} Dokumente · {e(docs['semester'].split(':')[0])}"
+                     + (" · ⚠️ Fehler" if d.get("docs_error") else "") + " (/docs)")
         st = self.access_stats()
         L.append(f"Abo-Abrufe 24 h: {st[0]} von {st[1]} Geräten/IPs" if st else "Abo-Abrufe 24 h: n/a")
         chans = self.st.settings.get("channels", [])
@@ -1305,6 +2214,8 @@ class App:
             "/modules &lt;Modul&gt; – alle Termine eines Moduls (z. B. /modules M11)\n"
             "/modules alle – auch abgeschlossene Module\n"
             "/absent &lt;Modul&gt; &lt;Nr&gt; [min] – Fehlzeit eintragen (0 = löschen)\n"
+            "/docs – Unterlagen aus dem TraiNex-Archiv: Übersicht und Feed für die Dateien-App\n"
+            "/docs newurl – neue private Unterlagen-Links erzeugen\n"
             "/help – diese Hilfe\n\n"
             "📡 <b>Kanal hinzufügen/entfernen</b>\n"
             "Bot als Admin in den Kanal holen, dann direkt im Kanal <code>/addchannel</code> posten "
@@ -1320,7 +2231,8 @@ class App:
             r = self.sync(force=(arg.lower() == "force"), source="manual")
             if r["ok"]:
                 self.notify_admin(f"✅ Fertig in {r['dur']:.1f}s: {e(r['msg'])}"
-                                  + (" (im Kanal gepostet)" if r.get("changes") and self.channels() else ""))
+                                  + (" (im Kanal gepostet)" if r.get("changes") and self.channels() else "")
+                                  + (f"\n📚 Unterlagen: {e(r['docs'])}" if r.get("docs") else ""))
             if s["auto"]:
                 self.schedule_from(time.time())
         elif cmd == "/start":
@@ -1381,6 +2293,18 @@ class App:
                 self.tg.send(self.cfg.admin, *self.modules_view(show_all=bool(q)))
         elif cmd == "/absent":
             self.cmd_absent(parts[1:])
+        elif cmd == "/docs":
+            if arg.lower() == "newurl":
+                old = self.docs_dir()
+                s["docs_token"] = secrets.token_urlsafe(24); self.st.save()
+                if os.path.isdir(old):
+                    os.replace(old, self.docs_dir())
+                self.publish_docs()
+                self.notify_admin("🔑 Neue Unterlagen-Links, die alten sind ab sofort ungültig. "
+                                  "Im Kurzbefehl die Feed-Adresse ersetzen:\n"
+                                  f"<code>{e(self.docs_url())}/index.json</code>")
+            else:
+                self.notify_admin(self.docs_text())
         elif cmd == "/help":
             self.notify_admin(self.HELP)
         else:
@@ -1424,6 +2348,8 @@ class App:
         os.makedirs(c.web_dir, exist_ok=True)
         if self.st.d["events"]:
             self.publish()
+        if self.cfg.docs:
+            self.publish_docs()
         last = (self.st.d.get("last_run") or {}).get("time", 0)
         self.next_run = max(time.time() + 5, last + self.st.settings["interval"] * 60)
         # Startmeldung vor allen Telegram-Aufrufen: der Deploy wartet nur wenige Sekunden auf diese Zeile,
@@ -1438,6 +2364,7 @@ class App:
                     ("settime", "Intervall in Minuten setzen"), ("url", "Abo-URL"),
                     ("newurl", "Neue Abo-URL erzeugen"), ("channels", "Registrierte Kanäle anzeigen"),
                     ("modules", "Module & Fehlzeiten"), ("absent", "Fehlzeit eintragen"),
+                    ("docs", "Unterlagen aus dem Archiv"),
                     ("help", "Hilfe")]],
                 scope={"type": "chat", "chat_id": int(c.admin)})
         except Exception as ex:
@@ -1507,15 +2434,76 @@ class App:
 
 # ───────────────────────── CLI ─────────────────────────
 
-def cmd_check(cfg, file=None, debug=False):
+def check_docs(cfg, req, out, dump=None):
+    """Probelauf Unterlagen: nur die Liste, keine Downloads. Mit dump werden die Seiten gespeichert."""
+    def rec(step, url, data=None, extra=None):
+        r = req(step, url, data, extra)
+        out["last"] = r
+        if dump:
+            os.makedirs(dump, exist_ok=True)
+            fn = os.path.join(dump, re.sub(r"\W+", "_", step).strip("_") + ".html")
+            with open(fn, "wb") as f:
+                f.write(r[2])
+            out.setdefault("files", []).append(fn)
+        return r
+    try:
+        out["listing"], out["label"], _, _ = fetch_archive(cfg, rec, dt.date.today())
+    except Exception as ex:  # Probelauf: Fehler anzeigen, Stundenplan-Check trotzdem ausgeben
+        out["error"] = str(ex) if isinstance(ex, SyncError) else f"Interner Fehler: {ex!r}"
+
+
+def print_docs(cfg, out):
+    print("\n── Unterlagen (Lernen → Archiv)")
+    for fn in out.get("files", []):
+        print(f"   gespeichert: {fn}")
+    if out.get("files"):
+        print("   (Die Seiten enthalten deinen Namen/Kurs – vor dem Weitergeben ggf. kürzen.)")
+    if out.get("last"):
+        page = _page(out["last"])
+        sel = re.search(r"(?is)<select\b[^>]*sem.*?</select>", page)
+        if sel:
+            print("   Semesterauswahl (HTML):", norm(page[max(0, sel.start() - 300):sel.end() + 200])[:900])
+        hits = list(re.finditer(r"(?i)datei_laden\.cfm", page)) or list(re.finditer(r"(?i)download", page))
+        for m in hits[:2]:
+            print("   Umfeld eines Dokument-Links (HTML):", norm(page[max(0, m.start() - 900):m.start() + 300]))
+    if "error" in out:
+        print(f"   Fehler: {out['error']}")
+        return
+    listing = out["listing"]
+    modules = module_codes(State(cfg).d["events"])
+    print(f"   Semester: {out['label']}\n   {len(listing)} Dokumente in der Liste")
+    for d in listing[:60]:
+        print(f"   • [{module_folder(d['folder'], modules)}] {d['title']}  ·  {doc_meta(d['info']) or d['info'][:60]}")
+    if len(listing) > 60:
+        print(f"   … und {len(listing) - 60} weitere")
+    old = State(cfg).d.get("docs", {})
+    if not old.get("items"):
+        print("   Noch kein gespeicherter Stand – beim ersten Lauf werden alle geladen (ohne Meldung im Kanal).")
+        return
+    _, entries, info = sync_docs(old, listing, out["label"], dt.datetime.now(TZ), force=True)
+    if info["sem_changed"]:
+        print("   Neues Semester – der nächste Lauf importiert die Liste neu (ohne Meldung im Kanal).")
+        return
+    label = {"new": "neu", "upd?": "evtl. geändert", "del": "entfernt"}
+    print(f"   {len(entries)} Änderung(en) gegenüber gespeichertem Stand:")
+    for t, it in entries:
+        print(f"   {label.get(t, t)}: {it['title']} ({it['folder'] or '–'})")
+
+
+def cmd_check(cfg, file=None, debug=False, dump=None):
     if file:
         with open(file, encoding="utf-8") as f:
             text = f.read()
     else:
         cfg.require("user", "pw")
         t0 = time.time()
-        text = fetch_trainex(cfg, debug)
+        docs = {}
+        text = fetch_trainex(cfg, debug, extra=(lambda req, dl: check_docs(cfg, req, docs, dump))
+                             if cfg.docs else None)
         print(f"\nLogin + Export ok ({time.time() - t0:.1f}s)")
+        if cfg.docs:
+            print_docs(cfg, docs)
+            print()
     new = parse_ics(text)
     if not new:
         sys.exit("Fehler: Der Export ist leer (0 Termine). Bitte Ausgabe von 'sudo ./install.sh debug' schicken.")
@@ -1601,7 +2589,8 @@ def main(argv):
     elif cmd == "check":
         f = argv[argv.index("--file") + 1] if "--file" in argv else None
         try:
-            cmd_check(cfg, f, debug="--debug" in argv)
+            dump = argv[argv.index("--dump") + 1] if "--dump" in argv else None
+            cmd_check(cfg, f, debug="--debug" in argv, dump=dump)
         except SyncError as ex:
             sys.exit(f"Fehler: {ex}")
     elif cmd == "discover":
